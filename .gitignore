@@ -7,3 +7,9 @@ node_modules/
 dist/
 __pycache__/
 *.pyc
+*.egg-info/
+.ruff_cache/
+build/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
