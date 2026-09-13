@@ -45,6 +45,59 @@ class GatewayBoundaryTests(unittest.TestCase):
             with self.assertRaises(Rejected):
                 loads(raw)
 
+    def test_sse_event_error_field_variants_never_complete(self):
+        prefix = STREAM.removesuffix(b"data: [DONE]\r\n\r\n")
+        for newline in (b"\n", b"\r\n", b"\r"):
+            for field in (b"event:error", b"event: error"):
+                stream = prefix.replace(b"\r\n", newline) + newline.join(
+                    (
+                        field,
+                        b'data:{"message":',
+                        b'data: "provider failed"}',
+                        b"",
+                        b"data:[DONE]",
+                        b"",
+                        b"",
+                    )
+                )
+                for index in range(len(stream) + 1):
+                    with self.subTest(newline=newline, field=field, split=index):
+                        observer = StreamObserver()
+                        observer.feed(stream[:index])
+                        observer.feed(stream[index:])
+                        observer.end()
+                        self.assertTrue(observer.error)
+                        self.assertTrue(observer.done)
+                        self.assertFalse(observer.invalid)
+                        self.assertFalse(observer.complete)
+
+    def test_sse_event_field_literal_values_last_value_and_reset(self):
+        prefix = STREAM.removesuffix(b"data: [DONE]\r\n\r\n")
+        for fields in (
+            b"event:  error",
+            b"event:\terror",
+            b"Event:error",
+            b":event:error",
+            b"event:error\nevent:message",
+            b"event:error\nevent",
+            b"event:error\n\n",
+        ):
+            with self.subTest(fields=fields):
+                observer = StreamObserver()
+                observer.feed(prefix + fields + b'\ndata:{"message":"fixture"}\n\ndata:[DONE]\n\n')
+                self.assertFalse(observer.error)
+                self.assertTrue(observer.complete)
+        for fields, data in (
+            (b"event:message\nevent:error", b'data:{"message":"failed"}'),
+            (b"event:error", b"data:[DONE]"),
+            (b"event:error", b"data"),
+        ):
+            with self.subTest(fields=fields, data=data):
+                observer = StreamObserver()
+                observer.feed(prefix + fields + b"\n" + data + b"\n\n")
+                self.assertTrue(observer.error)
+                self.assertFalse(observer.complete)
+
     def test_field_patch_adds_missing_and_replaces_escaped_keys(self):
         raw = b' { "\\u006dodel":"old", "messages": [], "x": 0.123456789012345678901 } '
         effective = {"model": "new", "reasoning_effort": None}

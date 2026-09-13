@@ -168,6 +168,7 @@ class StreamObserver:
         self.expected_choices, self.limit = expected_choices, limit
         self.buffer = bytearray()
         self.data = []
+        self.event_type = b""
         self.event_size = 0
         self.done = self.invalid = self.error = False
         self.finished = set()
@@ -194,11 +195,17 @@ class StreamObserver:
             if not line:
                 self.dispatch()
                 self.data.clear()
+                self.event_type = b""
                 self.event_size = 0
-            elif line.startswith(b"data:"):
-                self.data.append(line[5:].removeprefix(b" "))
-            elif line == b"event: error":
-                self.error = True
+            else:
+                # SSE splits at the first colon and removes at most one leading space.
+                # A colonless field has an empty value; comments/unknown fields are ignored.
+                field, _, value = line.partition(b":")
+                value = value.removeprefix(b" ")
+                if field == b"data":
+                    self.data.append(value)
+                elif field == b"event":
+                    self.event_type = value
         if len(self.buffer) > self.limit or self.invalid:
             self.invalid = True
             self.buffer.clear()
@@ -207,6 +214,8 @@ class StreamObserver:
     def dispatch(self):
         if not self.data:
             return
+        if self.event_type == b"error":
+            self.error = True
         data = b"\n".join(self.data)
         if self.done:
             self.invalid = True

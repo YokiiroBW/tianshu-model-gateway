@@ -311,6 +311,56 @@ class GatewayHttpTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(token, " ".join(logs.output))
         self.assertEqual(len(self.services.calls), 4)
 
+    async def test_sse_event_error_field_variants_persist_unknown_without_byte_rewriting(self):
+        completed = b'data:{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}'
+        self.services.mode = "sse_hold"
+        for newline in (b"\n", b"\r\n", b"\r"):
+            for field in (b"event:error", b"event: error"):
+                with self.subTest(newline=newline, field=field):
+                    self.services.release.clear()
+                    error_prefix = newline.join(
+                        (
+                            completed,
+                            b"",
+                            field,
+                            b'data:{"message":',
+                            b'data: "provider failed"}',
+                            b"",
+                            b"",
+                        )
+                    )
+                    # Deliver the whole error event before EOF; the padding also drains the
+                    # existing secret-check tail without changing the forwarding implementation.
+                    self.services.stream = (
+                        error_prefix
+                        + b":"
+                        + b"x" * 350
+                        + newline * 2
+                        + b"data:[DONE]"
+                        + newline * 2
+                    )
+                    received = b""
+                    async with await self.post({**self.body, "stream": True}) as response:
+                        request_id = response.headers["X-Request-ID"]
+                        async with asyncio.timeout(1):
+                            received = await response.content.readexactly(len(error_prefix))
+                        self.assertEqual(received, error_prefix)
+                        self.services.release.set()
+                        with self.assertRaises(aiohttp.ClientPayloadError):
+                            async for chunk in response.content.iter_any():
+                                received += chunk
+                    self.assertEqual(received, self.services.stream[: len(received)])
+                    await self.idle()
+                    route = await self.receipt(request_id)
+                    self.assertEqual(route["outcome"], "unknown")
+                    self.assertFalse(route["usage_complete"])
+                    self.assertFalse(route["fallback_used"])
+                    reason = self.gateway.diagnostics.connection.execute(
+                        "SELECT reason FROM requests WHERE request_id=?", (request_id,)
+                    ).fetchone()[0]
+                    self.assertEqual(reason, "incomplete_stream")
+        self.assertEqual(len(self.services.calls), 6)
+
     async def test_reflected_secret_split_across_real_http_chunks_is_blocked(self):
         for mode in ("secret_json", "secret_stream"):
             self.services.mode = mode
