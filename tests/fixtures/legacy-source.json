@@ -1,0 +1,11 @@
+{
+  "commit": "f73569edd14f7a92e7b8417344004b499f52554f",
+  "files": {
+    "src/aigateway/dataplane.py": "197dfefe297cf6642b99142aab26ac5c5ed820feb978932e5c171a9c4618f369",
+    "src/aigateway/domain.py": "da9f9e94c498295c9fa1a92b6a13533da07b6ecf486cce4cf424a8c027a2c914",
+    "src/aigateway/storage/repository.py": "4582a1045ab60e9b7ce8b67f698612a5ecb795b24f989c1be7192852d9b62803",
+    "src/aigateway/endpoint_policy.py": "5f2a5bd63fb73ba58e059d5e07482bdcf7deb15c86f791ed7b0dc175536ea46f",
+    "src/aigateway/http_server.py": "19dafceb4344bb6d8a721dca8b8ba69a4c460aef1590266493acbf7aaca6c231",
+    "tests/test_dataplane.py": "1327d7ee1a4f7c1931f801c12acabb170cf391b297dc8e8f308c5c14b5a02acf"
+  }
+}

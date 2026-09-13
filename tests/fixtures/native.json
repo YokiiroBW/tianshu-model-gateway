@@ -1,0 +1,60 @@
+{
+  "provenance": "Synthetic offline TS-040 samples. Model IDs and state references are invented; not provider acceptance evidence.",
+  "requests": [
+    {
+      "protocol": "openai_responses",
+      "path": "/v1/responses",
+      "headers": {"OpenAI-Beta": "fixture-feature", "Authorization": "fixture-never-forward"},
+      "body": {
+        "model": "fixture-client-model",
+        "input": [{"type": "function_call_output", "call_id": "call_fixture", "output": "{\"ok\":true}"}],
+        "previous_response_id": "resp_fixture",
+        "reasoning": {"effort": "low", "summary": "auto"},
+        "include": ["reasoning.encrypted_content"],
+        "tools": [{"type": "function", "name": "fixture_lookup", "description": "Offline fixture", "parameters": {"type": "object", "properties": {}, "additionalProperties": false}, "strict": true}],
+        "tool_choice": "auto", "parallel_tool_calls": false,
+        "text": {"format": {"type": "json_schema", "name": "fixture", "schema": {"type": "object", "properties": {}, "additionalProperties": false}, "strict": true}},
+        "stream": true, "store": false,
+        "x_fixture_extension": {"nullable": null, "list": [0, false, "中文"]}
+      }
+    },
+    {
+      "protocol": "openai_chat_completions",
+      "path": "/v1/chat/completions",
+      "headers": {"Authorization": "fixture-never-forward"},
+      "body": {
+        "model": "fixture-client-model", "reasoning_effort": "low",
+        "messages": [
+          {"role": "assistant", "content": null, "tool_calls": [{"id": "call_fixture", "type": "function", "function": {"name": "fixture_lookup", "arguments": "{}"}}]},
+          {"role": "tool", "tool_call_id": "call_fixture", "content": "fixture-result"}
+        ],
+        "tools": [{"type": "function", "function": {"name": "fixture_lookup", "parameters": {"type": "object", "properties": {}}}}],
+        "tool_choice": "auto", "parallel_tool_calls": false,
+        "stream": true, "stream_options": {"include_usage": true},
+        "x_fixture_extension": {"nullable": null, "list": [0, false, "中文"]}
+      }
+    },
+    {
+      "protocol": "anthropic_messages",
+      "path": "/v1/messages",
+      "headers": {"anthropic-version": "2023-06-01", "anthropic-beta": "fixture-feature", "x-api-key": "fixture-never-forward"},
+      "body": {
+        "model": "fixture-client-model", "max_tokens": 2048,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "output_config": {"effort": "low"},
+        "messages": [
+          {"role": "assistant", "content": [{"type": "thinking", "thinking": "fixture", "signature": "fixture-signature"}, {"type": "tool_use", "id": "toolu_fixture", "name": "fixture_lookup", "input": {}}]},
+          {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_fixture", "content": "fixture-result", "is_error": false}]}
+        ],
+        "tools": [{"name": "fixture_lookup", "input_schema": {"type": "object", "properties": {}}}],
+        "stream": true,
+        "x_fixture_extension": {"nullable": null, "list": [0, false, "中文"]}
+      }
+    }
+  ],
+  "streams": [
+    {"protocol": "openai_responses", "wire": "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_fixture\",\"output_index\":0,\"sequence_number\":1,\"delta\":\"中文\"}\n\nevent: fixture.future\ndata: {\"opaque\":true}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture\",\"usage\":null}}\n\n"},
+    {"protocol": "openai_chat_completions", "wire": "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_fixture\",\"function\":{\"arguments\":\"中文\"}}]}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\ndata: [DONE]\n\n"},
+    {"protocol": "anthropic_messages", "wire": "event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\nevent: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"fixture-signature\"}}\r\n\r\nevent: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"中文\"}}\r\n\r\nevent: error\r\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"fixture\"}}\r\n\r\n"}
+  ]
+}
