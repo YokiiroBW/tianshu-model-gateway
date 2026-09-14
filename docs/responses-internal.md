@@ -1,10 +1,10 @@
-# TS-042 内部 Responses 传输
+# TS-042 原生 Responses 传输
 
-状态：内部可测试实现，公开 `/v1/responses` 保持 501。合同候选不可被运行时读取；现行配置服务和 Chat 源文件没有改动。首轮是传输组件验收，尚不是正式 Responses 网关路由验收。
+状态：传输与公开路由已实现并接线；默认部署不注册 `/v1/responses`（返回 501），只有显式 `native_enabled` + 已发布 native 合同目录才开启。运行时只读取已发布的 `contracts/model-protocol/v1` 1.0.0；历史候选目录仅供追溯，不被运行时读取。部署字段、身份、版本、回执与错误码见[运行说明](docs/gateway-runtime.md)。
 
 ## 原生行为
 
-`send_responses` 接收已解析目标、现有 RegisteredTargets、专用 aiohttp session、SQLite Diagnostics、原始 JSON bytes 与异步下游 sink。它仅发一次 POST `{base_url}/responses`，不重新序列化请求，不填 model/reasoning/store/stream 等默认值，不重试、不跟随重定向。异步 write 保留背压；总超时包括下游等待。会话须按现有 Gateway 创建方式禁用环境代理、自动解压与 cookie，使用注册地址 resolver。该内部接口不是配置发布者或鉴权入口。
+`send_responses` 接收已解析目标、现有 RegisteredTargets、专用 aiohttp session、native ledger、原始 JSON bytes 与异步下游 sink。它仅发一次 POST `{base_url}/responses`，不重新序列化请求，不填 model/reasoning/store/stream 等默认值，不重试、不跟随重定向。异步 write 保留背压；总超时包括下游等待。会话须按现有 Gateway 创建方式禁用环境代理、自动解压与 cookie，使用注册地址 resolver。该模块不是配置发布者或鉴权入口：身份、版本与回执由 `native.py`/`server.py` 在调用前确定，调用者必须先写入 native 账本（`native_begin`），本模块只负责该行的收尾与可选的合同校验钩子。
 
 ResponsesObserver 复用现有有界 SSE 分帧器，识别原生 `response.completed`、`response.failed`、`response.incomplete` 和 `error`；不要求 Chat 的 `[DONE]`，不转换输出项目或 delta，不重排未知事件。每个观察事件上限 256 KiB，超过上限保持传输字节路径但不能宣布成功；最终报告 unknown 并由调用者中断下游。断流、终态后数据、冲突响应 ID、格式错误、取消及超时都不能写成功。连接关闭不证明远端生成取消成功。
 
@@ -18,11 +18,11 @@ HTTP JSON 错误保留状态和安全正文；原生 failed/incomplete JSON/SSE 
 
 已知远端引用按原生位置拒绝：previous_response_id/conversation/prompt、缓存 comparison_response_id、item_reference（含省略 type 的 ID 引用）、文件/容器引用等。后台、文件/图像/音频、内置远程工具、WebSocket 与 retrieve/delete/cancel/compact 等生命周期入口不实现。store 保持客户端选择；stateless 表示不消费服务器引用，不表示网关强制供应商不存储。其他供应商与 embedding 不在本块范围。
 
-正式接线需先发布根独立合同，并由平台唯一配置 owner 增加明确包/版本适配；网关随后验证认证 principal/namespace/provider/model/版本与有效期、撤销、配额、路由及 receipt，才能调用该内部模块。当前没有第二份 runtime 配置、假认证主体或可用新 endpoint。候选的最小安全选择是保留客户端参数，拒绝不匹配目标与全部状态引用。
+接线现状：根独立合同已由协调者发布（`contracts/model-protocol/v1` 1.0.0），网关消费该包并已注册 `POST /v1/responses` 与 `GET /internal/v1/native-model-requests/{request_id}`，但默认关闭、只有部署显式启用才注册。网关验证认证 principal/namespace/provider/model/native 版本与有效期/撤销/绑定关系，并生成 route_context 与 native 回执。平台唯一 Models owner 的 native 快照生产者仍待其增量实现：正式发布状态在根包中仍为 `runtime_disabled_until_joint_acceptance`，本卡不声明联合验收或生产可用。
 
 ## 证据与来源
 
-测试采用隔离 loopback HTTP 录制上游，原生字段与精确数字 bytes、单字节 SSE、多分片观察、错误、缺失/部分 usage、断流、取消、背压和凭据反射；旧 Chat 使用现有网关 HTTP 回归。它们证明组件与 HTTP 替身行为，不代表真实平台 Responses 发布、模型兼容或生产费用测试。
+测试采用隔离 loopback HTTP 录制上游，原生字段与精确数字 bytes、单字节 SSE、多分片观察、错误、缺失/部分 usage、断流、取消、背压和凭据反射；另有真实 HTTP 网关级检查（native + 旧 Chat 同号不串用、撤权两向、回执归属隔离），并把实际录制的配置请求、快照、回执与上游/下游文档喂给发布方 `validate.py` 的 `exchange()` 关系逻辑。它们证明组件与 HTTP 替身行为，不代表真实平台 Responses 发布、模型兼容或生产费用测试。
 
 2026-09-14 使用 OpenAI Docs 实际查阅：
 

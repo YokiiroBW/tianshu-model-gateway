@@ -19,12 +19,36 @@ from .config import (
     read_limited,
     utcnow,
 )
-from .contracts import Contracts, Rejected, loads
+from .contracts import (
+    NATIVE_CONTRACT,
+    NATIVE_RECEIPT_PATH,
+    NATIVE_ROUTE_PATH,
+    NATIVE_VERSION_HEADER,
+    Contracts,
+    Rejected,
+    loads,
+)
 from .diagnostics import Diagnostics, redact
+from .native import (
+    NativeConfigCache,
+    NativeConfigSource,
+    NativeGrant,
+    authorize,
+    requested_version,
+    route_context,
+    route_receipt,
+    select_native_route,
+)
+from .responses import send_responses, validate_request
 from .routing import PROTOCOL, SecretGuard, StreamObserver, apply_fields, prepare, record_usage
 
 LOG = logging.getLogger("tianshu_gateway")
 INTERNAL_HEADERS = {"x-tianshu-config-version", "x-tianshu-workload", "x-tianshu-turn-id"}
+NATIVE_HEADERS = {
+    NATIVE_VERSION_HEADER.lower(),
+    "x-tianshu-turn-id",
+}
+NATIVE_ROUTE_HEADERS = {"x-request-id"} | NATIVE_HEADERS | {"authorization"}
 REQUEST_ID = web.RequestKey("request_id", str)
 FORWARD_STARTED = web.RequestKey("forward_started", bool)
 STREAM_RESPONSE = web.RequestKey("stream_response", web.StreamResponse)
@@ -40,6 +64,10 @@ class Settings:
     secret_references: dict[str, str]
     targets: list[dict]
     clients: list[ClientGrant]
+    native_enabled: bool = False
+    native_contract_directory: str | None = None
+    native_clients: list[NativeGrant] = field(default_factory=list)
+    revoked_native_versions: list[int] = field(default_factory=list)
     max_request_bytes: int = 1_048_576
     max_response_bytes: int = 8_388_608
     max_concurrent: int = 16
@@ -50,7 +78,7 @@ class Settings:
     revoked_versions: list[int] = field(default_factory=list)
 
     def validate(self):
-        if not self.clients:
+        if not self.clients and not self.native_clients:
             raise ValueError("authenticated client registration required")
         if (
             min(
@@ -76,6 +104,28 @@ class Settings:
             for c in self.clients
         ):
             raise ValueError("invalid client grant")
+        if type(self.native_enabled) is not bool:
+            raise ValueError("invalid native switch")
+        native_material = bool(
+            self.native_clients
+            or self.native_contract_directory is not None
+            or self.revoked_native_versions
+        )
+        if native_material and not self.native_enabled:
+            # Native stays off by default; half-configured material must not look absent.
+            raise ValueError("native material requires explicit enable")
+        if any(type(v) is not int or v < 1 for v in self.revoked_native_versions):
+            raise ValueError("invalid revoked native version")
+        if not self.native_enabled:
+            return
+        if not self.native_contract_directory:
+            raise ValueError("published native contract directory required")
+        if not self.native_clients:
+            raise ValueError("authenticated native client registration required")
+        if len({g.service for g in self.native_clients}) != len(self.native_clients):
+            raise ValueError("one explicit native grant per service required")
+        for grant in self.native_clients:
+            grant.validate()
 
 
 class Gateway:
@@ -98,6 +148,25 @@ class Gateway:
             diagnostics,
             settings.config_refresh_seconds,
         )
+        # The native ledger is the same local database but a different key space.
+        self.native_ledger = diagnostics
+        self.native_cache = None
+        if settings.native_enabled:
+            self.native_cache = NativeConfigCache(
+                NativeConfigSource(
+                    session,
+                    contracts,
+                    targets,
+                    self.secrets,
+                    settings.platform_base_url,
+                    settings.platform_credential_ref,
+                    settings.platform_origin_env,
+                ),
+                contracts,
+                targets,
+                diagnostics,
+                settings.config_refresh_seconds,
+            )
         self.active = 0
         self.provider_active = {}
 
@@ -117,6 +186,61 @@ class Gateway:
             raise Rejected("unauthorized", 401)
         return matches[0]
 
+    def authenticate_native(self, request):
+        """Native clients are their own registration; Chat credentials never open them."""
+        token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        if request.headers.get("Authorization", "") != "Bearer " + token or not token:
+            raise Rejected("unauthorized", 401)
+        matches = []
+        for grant in self.settings.native_clients:
+            try:
+                expected = self.secrets.resolve(grant.credential_ref)
+            except Rejected:
+                continue  # Unset/revoked service credentials never authenticate.
+            if hmac.compare_digest(token.encode(), expected.encode()):
+                matches.append(grant)
+        if len(matches) != 1:
+            raise Rejected("unauthorized", 401)
+        return matches[0]
+
+    def native_context(self, request, grant):
+        """Trusted request identity and native version selection for one native call.
+
+        The Chat version header is rejected here and the native header is rejected on the
+        Chat route, so equal integers can never mean the same configuration.
+        """
+        if any(len(request.headers.getall(h, [])) > 1 for h in NATIVE_ROUTE_HEADERS):
+            raise Rejected()
+        if any(h in request.headers for h in ("openai-organization", "openai-project")):
+            raise Rejected("forbidden", 403)
+        if "x-tianshu-config-version" in request.headers or "x-tianshu-workload" in request.headers:
+            raise Rejected()
+        if not grant.internal:
+            if any(
+                h.lower().startswith("x-tianshu-") or h.lower() == "x-request-id"
+                for h in request.headers
+            ):
+                raise Rejected("forbidden", 403)
+            request_id, turn_id = str(uuid.uuid4()), str(uuid.uuid4())
+        else:
+            if any(
+                h.lower().startswith("x-tianshu-") and h.lower() not in NATIVE_HEADERS
+                for h in request.headers
+            ):
+                raise Rejected()
+            try:
+                request_id = request.headers["x-request-id"]
+                turn_id = request.headers["x-tianshu-turn-id"]
+            except KeyError:
+                raise Rejected() from None
+            for value in (request_id, turn_id):
+                self.contracts.validate("common#id", value)
+                if any(secret in value for secret in self.secrets.known_values()):
+                    raise Rejected()
+        authorize(grant)
+        version = requested_version(grant, request.headers.get(NATIVE_VERSION_HEADER))
+        return request_id, version, turn_id
+
     def context(self, request, grant):
         if any(
             len(request.headers.getall(h, [])) > 1
@@ -135,6 +259,9 @@ class Gateway:
         try:
             version = request.headers["x-tianshu-config-version"]
             if not version.isascii() or not version.isdecimal() or str(int(version)) != version:
+                raise ValueError()
+            if NATIVE_VERSION_HEADER.lower() in request.headers:
+                # Native versions are a different space; never reinterpret them as Chat.
                 raise ValueError()
             context = {
                 "request_id": request.headers["x-request-id"],
@@ -215,6 +342,149 @@ class Gateway:
             self.active -= 1
             if provider_id is not None:
                 self.provider_active[provider_id] -= 1
+
+    async def native_read(self, request):
+        """Receipt read bound to the trusted identity, never to the request ID alone."""
+        grant = self.authenticate_native(request)
+        result = self.native_ledger.native_get(grant.identity(), request.match_info["request_id"])
+        if result is None:
+            raise Rejected("not_found", 404)
+        return web.json_response(
+            redact(result, self.secrets.known_values()), headers={"Cache-Control": "no-store"}
+        )
+
+    async def native_responses(self, request):
+        grant = self.authenticate_native(request)
+        request_id, version, turn_id = self.native_context(request, grant)
+        request[REQUEST_ID] = request_id
+        if (
+            request.query_string
+            or request.content_type != "application/json"
+            or request.headers.get("Content-Encoding")
+        ):
+            raise Rejected()
+        if self.active >= self.settings.max_concurrent:
+            raise Rejected("queue_full", 429)
+        self.active += 1
+        provider_id = None
+        try:
+            async with asyncio.timeout(self.settings.request_read_timeout):
+                try:
+                    raw = await read_limited(request.content, self.settings.max_request_bytes)
+                except Rejected:
+                    raise Rejected("payload_too_large", 413) from None
+            # Native scope/state rejection precedes published shape checks.
+            body = validate_request(raw)
+            self.contracts.validate("native#native_request", body)
+            config = await self.native_cache.get(grant, version)
+            binding, provider = select_native_route(config, grant, body)
+            selected_version = config["native_config_version"]
+            selected_provider = provider["provider_id"]
+            if (
+                self.provider_active.get(selected_provider, 0)
+                >= self.settings.max_provider_concurrent
+            ):
+                raise Rejected("queue_full", 429)
+            credential = self.secrets.resolve(provider["credential_ref"])
+            self.targets.check(provider["base_url"])
+            # Recheck after awaited config access and before sending.
+            if self.native_ledger.native_is_revoked(grant.identity(), selected_version):
+                raise Rejected("forbidden", 403)
+            secrets = self.secrets.known_values()
+            context = route_context(grant, provider, request_id, turn_id, selected_version)
+            self.contracts.validate("native#route_context", context)
+            receipt = route_receipt(
+                grant,
+                provider,
+                body,
+                request_id,
+                selected_version,
+                utcnow().isoformat().replace("+00:00", "Z"),
+            )
+            receipt = redact(receipt, (*secrets, credential))
+            self.contracts.validate("native#route_receipt", receipt)
+            # Only a caller-supplied turn can be pinned; an external caller's turn id is a
+            # per-request correlation value, not a repeated client turn.
+            self.native_ledger.native_begin(receipt, turn_id if grant.internal else None)
+            request[FORWARD_STARTED] = True
+            provider_id = selected_provider
+            self.provider_active[provider_id] = self.provider_active.get(provider_id, 0) + 1
+            # preserve_client: the client's own native bytes are the upstream payload.
+            return await self.forward_native(
+                request, raw, binding, provider, credential, receipt, secrets
+            )
+        except TimeoutError:
+            raise Rejected("timeout", 408) from None
+        finally:
+            self.active -= 1
+            if provider_id is not None:
+                self.provider_active[provider_id] -= 1
+
+    async def forward_native(
+        self, request, payload, binding, provider, credential, receipt, secrets
+    ):
+        """Stream native bytes downstream; never rewrite, retry or fabricate a terminal."""
+        state = {"response": None, "pending": None, "stream": False}
+
+        async def start_response(status, content_type):
+            headers = {
+                "Content-Type": content_type,
+                "Cache-Control": "no-store",
+                "X-Request-ID": receipt["request_id"],
+            }
+            if content_type == "text/event-stream":
+                response = web.StreamResponse(
+                    status=status, headers={**headers, "X-Accel-Buffering": "no"}
+                )
+                state["stream"] = True
+                state["response"] = response
+                request[STREAM_RESPONSE] = response
+                await response.prepare(request)
+            else:
+                state["pending"] = (status, headers)
+
+        async def write(chunk):
+            response = state["response"]
+            if response is None:
+                status, headers = state["pending"]
+                state["response"] = web.Response(body=chunk, status=status, headers=headers)
+                return
+            await response.write(chunk)
+
+        try:
+            await send_responses(
+                self.session,
+                self.targets,
+                self.native_ledger,
+                payload=payload,
+                base_url=provider["base_url"],
+                credential=credential,
+                receipt=receipt,
+                start_response=start_response,
+                write=write,
+                timeout=min(binding["timeout_ms"], self.settings.max_timeout_ms) / 1000,
+                max_response_bytes=self.settings.max_response_bytes,
+                max_request_bytes=self.settings.max_request_bytes,
+                secrets=secrets,
+                validate_response=lambda document: self.contracts.validate(
+                    "native#native_response", document
+                ),
+                validate_receipt=lambda document: self.contracts.validate(
+                    "native#route_receipt", document
+                ),
+            )
+        except Rejected:
+            response = state["response"]
+            if response is not None and response.prepared:
+                # Headers are already on the wire: no local error frame can be appended.
+                if request.transport:
+                    request.transport.abort()
+                return response
+            raise
+        response = state["response"]
+        if state["stream"]:
+            await response.write_eof()
+        return response
 
     async def forward(
         self, request, payload, body, provider, binding, credential, receipt, secrets
@@ -351,28 +621,42 @@ class Gateway:
             )
 
 
-def error_response(exc, request_id):
+def error_response(exc, request_id, contract=None):
+    """Chat errors use the shared envelope; native paths use the published native one."""
+    body = {
+        "schema_version": 1,
+        "request_id": request_id,
+        "code": exc.code,
+        "execution_state": exc.state,
+        "retryable": False,
+    }
+    if contract is not None:
+        body["contract"] = contract
     return web.json_response(
-        {
-            "schema_version": 1,
-            "request_id": request_id,
-            "code": exc.code,
-            "execution_state": exc.state,
-            "retryable": False,
-        },
+        body,
         status=exc.status,
         headers={"Cache-Control": "no-store", "X-Request-ID": request_id},
     )
 
 
+def native_route(request):
+    return request.path == NATIVE_ROUTE_PATH or request.path.startswith(NATIVE_RECEIPT_PATH)
+
+
 @web.middleware
 async def errors(request, handler):
     request[REQUEST_ID] = str(uuid.uuid4())
+    native = native_route(request)
+    contract = NATIVE_CONTRACT if native else None
     try:
         return await handler(request)
     except Rejected as exc:
-        return error_response(exc, request[REQUEST_ID])
+        return error_response(exc, request[REQUEST_ID], contract)
     except web.HTTPException as exc:
+        if native:
+            # The published native table has no 404/405 pair; an unknown method or path on
+            # a native interface stays a fixed not_found rather than an unmapped status.
+            return error_response(Rejected("not_found", 404), request[REQUEST_ID], contract)
         return error_response(Rejected("not_found", exc.status), request[REQUEST_ID])
     except asyncio.CancelledError:
         raise
@@ -385,8 +669,14 @@ async def errors(request, handler):
                 request.transport.abort()
             return stream
         if request.get(FORWARD_STARTED):
+            if native:
+                return error_response(
+                    Rejected("result_unknown", 502, "unknown"), request[REQUEST_ID], contract
+                )
             return error_response(Rejected("result_unknown", 503, "unknown"), request[REQUEST_ID])
-        return error_response(Rejected("dependency_unavailable", 503), request[REQUEST_ID])
+        return error_response(
+            Rejected("dependency_unavailable", 503), request[REQUEST_ID], contract
+        )
 
 
 GATEWAY = web.AppKey("gateway", Gateway)
@@ -394,10 +684,17 @@ GATEWAY = web.AppKey("gateway", Gateway)
 
 def create_app(settings):
     settings.validate()
-    contracts = Contracts(settings.contract_directory)
+    contracts = Contracts(
+        settings.contract_directory,
+        settings.native_contract_directory if settings.native_enabled else None,
+    )
     for client in settings.clients:
         contracts.validate("common#id", client.service)
         contracts.validate("common#id", client.provider_id)
+    for grant in settings.native_clients:
+        for value in (*grant.provider_ids, grant.service, grant.principal_id):
+            contracts.validate("common#id", value)
+        contracts.validate("common#id", grant.credential_namespace)
     targets = RegisteredTargets(settings.targets)
     targets.check(settings.platform_base_url)
     app = web.Application(middlewares=[errors], client_max_size=settings.max_request_bytes)
@@ -407,6 +704,10 @@ def create_app(settings):
         try:
             for version in settings.revoked_versions:
                 diagnostics.revoke(version)
+            for grant in settings.native_clients:
+                for version in settings.revoked_native_versions:
+                    # Independent key space: a native revocation never touches Chat rows.
+                    diagnostics.native_revoke(grant.identity(), version)
             connector = aiohttp.TCPConnector(
                 resolver=targets, limit=settings.max_concurrent + 1, ttl_dns_cache=0
             )
@@ -427,13 +728,31 @@ def create_app(settings):
     async def receipt(request):
         return await request.app[GATEWAY].receipt(request)
 
+    async def native_responses(request):
+        return await request.app[GATEWAY].native_responses(request)
+
+    async def native_receipt(request):
+        return await request.app[GATEWAY].native_read(request)
+
     async def unsupported(request):
         request.app[GATEWAY].authenticate(request)
         return error_response(Rejected("invalid_input", 501), request[REQUEST_ID])
 
+    async def native_disabled(request):
+        request.app[GATEWAY].authenticate(request)
+        return error_response(
+            Rejected("unsupported_operation", 501), request[REQUEST_ID], NATIVE_CONTRACT
+        )
+
     app.cleanup_ctx.append(resources)
     app.router.add_post("/v1/chat/completions", chat)
     app.router.add_get("/internal/v1/model-requests/{request_id}", receipt)
-    for path in ("/v1/responses", "/v1/messages", "/v1/embeddings"):
+    for path in ("/v1/messages", "/v1/embeddings"):
         app.router.add_route("*", path, unsupported)
+    if settings.native_enabled:
+        app.router.add_post(NATIVE_ROUTE_PATH, native_responses)
+        app.router.add_get(NATIVE_RECEIPT_PATH + "{request_id}", native_receipt)
+    else:
+        # Native stays closed until a deployment explicitly enables it.
+        app.router.add_route("*", NATIVE_ROUTE_PATH, native_disabled)
     return app

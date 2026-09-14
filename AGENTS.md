@@ -24,4 +24,4 @@ TS-040 历史离线实验命令：
 
 本地隔离开发和提交用于审查；不自动推送、部署或操作真实设备。交付短记录 docs/handoffs/<任务编号>.md，含实际变更、验证、风险及下一步。
 
-TS-042：`src/tianshu_gateway/responses.py` 是未注册路由的内部模块；不得用候选 schema 或 Chat 配置开启 Responses。内部验证命令 `.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_responses*.py' -v`；ruff check/format --check 覆盖 src 与两个 test_responses 文件。保持依赖锁与公开 Chat 配置路径原样。正式新包、平台生产者适配、网关认证消费三项都就绪后才单独验收公开路由。
+TS-042：根 `contracts/model-protocol/v1` 1.0.0 已发布（manifest LF SHA256 `52711a71de56dbceebd1d5d96b2baf59a2d9551168029972d59111480f815141`）；`src/tianshu_gateway/native.py` 与接线后的 `/v1/responses` 消费该包。默认 native 关闭，只有部署显式 `native_enabled` 且提供已发布 native 合同目录时才注册路由，否则该路径仍返回 501。不得用候选 schema、Chat 配置或 Chat 授权开启 Responses；native 账本键空间含 contract/principal/caller/namespace，与旧 Chat 版本及撤销链互不继承。内部验证命令 `.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_responses*.py' -v`；ruff check/format --check 覆盖 src 与三个 test_responses 文件（含 `tests/test_responses_native.py`）。保持依赖锁与公开 Chat 配置路径原样。公开路由的联合验收仍需平台生产者适配与协调者确认，本卡不代替该验收。

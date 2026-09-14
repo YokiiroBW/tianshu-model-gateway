@@ -1,4 +1,4 @@
-"""Offline/loopback-only Responses tests; no published gateway route is enabled."""
+"""Offline/loopback-only Responses transport tests; the gateway route is covered elsewhere."""
 
 import asyncio
 import json
@@ -17,6 +17,7 @@ from tianshu_gateway.diagnostics import Diagnostics
 from tianshu_gateway.responses import ResponsesObserver, send_responses, validate_request
 
 TOKEN = "fixture-responses-token-042"
+SCOPE = ("model-protocol/v1", "fixture-principal", "fixture-service", "credential-namespace-x")
 NATIVE = {
     "object": "response",
     "id": "resp_fixture",
@@ -247,11 +248,15 @@ class ResponsesHttpTests(unittest.IsolatedAsyncioTestCase):
         self.request_id = f"fixture-{self.counter}"
         payload = encode(BODY if body is None else body)
         receipt = {
+            "contract": "model-protocol/v1",
             "caller_service": "fixture-service",
+            "principal_id": "fixture-principal",
+            "credential_namespace": "credential-namespace-x",
             "request_id": self.request_id,
             "protocol": "openai-responses",
-            "config_version": 7,
+            "native_config_version": 7,
             "resolved_model": "exact-fixture-model",
+            "outcome": "unknown",
         }
         args = dict(
             payload=payload,
@@ -263,14 +268,17 @@ class ResponsesHttpTests(unittest.IsolatedAsyncioTestCase):
             timeout=2,
         )
         args.update(kwargs)
+        if "receipt" not in kwargs:
+            # The route records the receipt before the wire attempt; revocation is native.
+            self.diagnostics.native_begin(receipt, None)
         await send_responses(self.session, self.targets, self.diagnostics, **args)
 
     def saved(self):
-        return self.diagnostics.get("fixture-service", self.request_id)
+        return self.diagnostics.native_get(SCOPE, self.request_id)
 
     def reason(self):
         return self.diagnostics.connection.execute(
-            "SELECT reason FROM requests WHERE request_id=?", (self.request_id,)
+            "SELECT reason FROM native_requests WHERE request_id=?", (self.request_id,)
         ).fetchone()[0]
 
     async def test_http_raw_request_response_exact_and_no_parameter_defaults(self):
@@ -418,9 +426,29 @@ class ResponsesHttpTests(unittest.IsolatedAsyncioTestCase):
             await self.send(base_url=self.base + "/unregistered")
         with self.assertRaises(Rejected):
             await self.send(
-                receipt={"protocol": "openai-chat-completions", "resolved_model": BODY["model"]}
+                receipt={
+                    "contract": "model-protocol/v1",
+                    "caller_service": "fixture-service",
+                    "principal_id": "fixture-principal",
+                    "credential_namespace": "credential-namespace-x",
+                    "request_id": "fixture-chat",
+                    "protocol": "openai-chat-completions",
+                    "native_config_version": 7,
+                    "resolved_model": BODY["model"],
+                }
             )
-        self.diagnostics.revoke(7)
+        with self.assertRaises(Rejected):
+            # A Chat-shaped receipt (legacy version field only) never reaches the wire.
+            await self.send(
+                receipt={
+                    "caller_service": "fixture-service",
+                    "request_id": "fixture-legacy",
+                    "protocol": "openai-responses",
+                    "config_version": 7,
+                    "resolved_model": BODY["model"],
+                }
+            )
+        self.diagnostics.native_revoke(SCOPE, 7)
         with self.assertRaises(Rejected):
             await self.send()
         self.assertEqual(self.calls, [])
@@ -473,7 +501,9 @@ class ResponsesHttpTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(Rejected):
             await self.send(max_response_bytes=10)
         self.assertEqual(self.saved()["outcome"], "unknown")
-        with patch.object(self.diagnostics, "finish", side_effect=OSError("fixture disk error")):
+        with patch.object(
+            self.diagnostics, "native_finish", side_effect=OSError("fixture disk error")
+        ):
             with self.assertRaises(OSError):
                 await self.send()
         self.assertEqual(self.saved()["outcome"], "unknown")

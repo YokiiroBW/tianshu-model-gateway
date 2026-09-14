@@ -11,6 +11,7 @@ from aiohttp import web
 
 from .config import ClientGrant
 from .contracts import loads
+from .native import NativeGrant
 from .server import Settings, create_app
 
 
@@ -42,6 +43,8 @@ def main():
             tls.load_cert_chain(args.tls_cert, args.tls_key)
         data = loads(Path(args.settings).read_bytes())
         data["clients"] = [ClientGrant(**client) for client in data["clients"]]
+        if data.get("native_clients") is not None:
+            data["native_clients"] = [NativeGrant(**grant) for grant in data["native_clients"]]
         settings = Settings(**data)
         if args.local_test:
             if not all(

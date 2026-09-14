@@ -57,7 +57,7 @@
 - `POST /v1/chat/completions` 接受原生 JSON。内部服务必须带 `X-Request-ID`、`X-Tianshu-Config-Version`、`X-Tianshu-Workload: companion.text`、`X-Tianshu-Turn-ID`；客户端服务身份由 Bearer 认证决定。外部客户端使用部署固定版本/provider，提交这些内部头会被拒绝。
 - `GET /internal/v1/model-requests/{request_id}` 只返回当前认证服务自己记录的 model.route_receipt，不返回正文或凭据引用。查询他服务 ID 与不存在都为 404。无路由前校验失败没有成功回执。
 - 同一服务/轮次首次上游调用持久固定版本；同一服务 request_id 再提交返回 409，不重放上游。查询已有回执用于核对；此 ID 冲突保护不等于整个 native API 的幂等重放服务，也不替代业务幂等键。
-- `POST /v1/responses`、`/v1/messages`、`/v1/embeddings` 明确返回 501。其他未实现路径不转换为 Chat。消息中已识别的 response/conversation/file/container 引用无法解析黏性时拒绝；工具与输出 schema 的字段声明不当作状态 ID。未识别供应商方言不承诺状态支持。
+- `POST /v1/responses` 只在部署显式启用 native 时注册（见下节），否则与 `/v1/messages`、`/v1/embeddings` 一样明确返回 501。其他未实现路径不转换为 Chat。消息中已识别的 response/conversation/file/container 引用无法解析黏性时拒绝；工具与输出 schema 的字段声明不当作状态 ID。未识别供应商方言不承诺状态支持。
 
 默认 `preserve_client` 保留客户端指定模型和原生 JSON 字段。只有 `default_if_absent` 补缺失，`force` 按发布策略覆盖；内部 binding 可补缺失 model。缺 model 的 requested_model 为 null；显式 model:null、空白或控制字符拒绝，force 也不修复非法 null。`reasoning_effort` 的 null/false/0/未知字符串均是值，不当缺省；其他原生思考/工具扩展保留于正文。回执按发布关系只投影 reasoning_effort，不把未知方言改为通用 effort 枚举。策略仅修改指定顶层值的 JSON 字节区间，其余内容（含高精度数值表示）保持。重复键、非 UTF-8、NaN/Infinity 和超出 Python 有限浮点范围的数值拒绝。
 
@@ -76,3 +76,40 @@
 这不是 TS-050 多产品 L0，也不是 L1 或生产验收。下一步是协调 TS-012 的真实配置读取、来源引用/授权、撤销信号，之后才进行陪伴文字链联合验证。生产 PostgreSQL、TLS/私网审查、真实模型能力/价格与平台发布授权均单独验收。
 
 传输实现核对依据：[aiohttp 客户端文档](https://docs.aiohttp.org/en/stable/client.html)、[服务端取消与异步处理](https://docs.aiohttp.org/en/stable/web_advanced.html)。这些资料仅支持本项目采用的传输 API，不替代运行证据。
+
+## TS-042 原生 Responses 运行边界
+
+消费已发布 `contracts/model-protocol/v1` 1.0.0（manifest LF SHA256 `52711a71de56dbceebd1d5d96b2baf59a2d9551168029972d59111480f815141`）。默认关闭：只有显式给出下面四项才注册路由，缺任一项在启动时报配置错误，不会“看起来可用”。
+
+```json
+{
+  "native_enabled": true,
+  "native_contract_directory": "C:/deployment/contracts/model-protocol/v1",
+  "native_clients": [
+    {
+      "service": "native-companion",
+      "credential_ref": "secret-ref:gateway/native-companion",
+      "principal_id": "principal-a",
+      "credential_namespace": "credential-namespace-a",
+      "provider_ids": ["provider-a"],
+      "native_config_versions": [7, 8],
+      "native_config_version": 7,
+      "permissions": ["config.snapshot"],
+      "internal": true,
+      "expires_at": "2026-10-01T00:00:00Z"
+    }
+  ],
+  "revoked_native_versions": []
+}
+```
+
+- 路由：`POST /v1/responses`（原生 JSON 或原生 SSE）与 `GET /internal/v1/native-model-requests/{request_id}`。native 关闭时前者返回 501 `unsupported_operation`（native 合同信封），回执路径为 404。
+- 身份：`principal_id`、`caller_service`、`credential_namespace` 只来自 `native_clients` 注册；请求体、`metadata`/`user` 字段或任意客户端头都不构成身份。native 凭据与 Chat 凭据互不通用，注册 `expires_at`/`revoked` 或缺少 `config.snapshot` 权限即拒绝。
+- 版本：可信内部服务用 `X-Tianshu-Native-Config-Version`（正整数，须在 `native_config_versions` 内）；外部注册可用部署固定的 `native_config_version`，为 null 时由平台选授权最新版，网关仍会校验返回值在授权集合内。Chat 路由拒绝 native 版本头，native 路由拒绝 Chat 的 `X-Tianshu-Config-Version`/`X-Tianshu-Workload`，两套相同整数不代表同一配置。
+- 配置：`POST {platform_base_url}/internal/v1/model-config/native/snapshot`，`native_config_request` 含 `query`/`native_config_version`/`contract`，origin 引用仍取自 `platform_origin_env`。平台 403/410 会按该主体+版本持久拒绝；5xx 只允许继续使用已验证且未过期的同版缓存；404/关联 ID 不符/窗口过期分别返回 404/409/503，不降到 Chat。
+- 路由与保真：`preserve_client` 只做精确模型匹配（客户端 model 必须等于 provider/binding model，缺失或不同即 400），不补默认、不替换；请求原始 bytes 直发上游 `{base_url}/responses`，只加协议所需 `Content-Type`/`Accept`/`Accept-Encoding: identity` 与单独解析的上游凭据。状态引用（previous_response_id/conversation/prompt/缓存比较 ID/item_reference/文件容器引用）在发送前拒绝。
+- 结果与回执：native 回执只写 `native_config_version` 与 `openai-responses`，不写 Chat 版本或协议；`requested_reasoning`/`effective_reasoning` 只投影原生 reasoning，`applied_policies` 为空，`fallback_used=false`。上游 2xx JSON/SSE bytes 原样回传，上游错误保留状态与安全原生 JSON（不转发 Location/Set-Cookie/Cookie，不套本地信封）。断流、取消、发送后超时、落盘失败记 unknown 且不自动重放；超时诊断 reason 为 `timeout_unknown`。
+- 回执读取按 (contract, principal, caller, namespace) 归属校验，且与 Chat 账本、Chat 撤销链完全分开：撤销 Chat 版本 7 不影响 native 7，反之亦然。
+- 上限沿用现有 `max_request_bytes`/`max_response_bytes`/`max_concurrent`/`max_provider_concurrent`/`max_timeout_ms`，上游总时限取 binding.timeout_ms 与该上限较小值。
+- 验证界限：`tests/test_responses_native.py` 用独立 loopback 端口启动平台替身（同时提供 Chat 与 native 快照）、录制上游与真实网关，覆盖 JSON/SSE 字节保真、发布方 `validate.py` 的 `exchange()` 关系、错误状态、断流/取消/超时、部分/未知/零用量、撤权两个方向、回执隔离、同号不串用与秘密反射；不代表平台生产者已实现、也不代表生产可用。当前接口在根包中仍为 `runtime_disabled_until_joint_acceptance`。
+

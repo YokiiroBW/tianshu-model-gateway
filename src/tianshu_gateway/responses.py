@@ -1,7 +1,8 @@
-"""Internal Responses transport; deliberately not registered as a gateway route.
+"""Native Responses transport used by the registered gateway route.
 
-The caller must eventually supply an authenticated, published route. Until then this
-module is exercised only by isolated HTTP fixtures, never by the Chat config path.
+The caller owns trusted identity, configuration and ledger start; this module owns the
+single upstream HTTP attempt, bounded observation and the ledger finish. It never reads
+Chat configuration, never takes identity from the payload and never replays a request.
 """
 
 import asyncio
@@ -10,8 +11,8 @@ import time
 import aiohttp
 
 from .config import read_limited, utcnow
-from .contracts import Rejected, loads
-from .diagnostics import redact
+from .contracts import NATIVE_CONTRACT, Rejected, loads
+from .diagnostics import native_identity, redact
 from .routing import SecretGuard, StreamObserver
 
 PROTOCOL = "openai-responses"
@@ -161,7 +162,7 @@ def record_observation(receipt, observer, complete):
 async def send_responses(
     session,
     targets,
-    diagnostics,
+    ledger,
     *,
     payload,
     base_url,
@@ -173,27 +174,42 @@ async def send_responses(
     max_response_bytes=8_388_608,
     max_request_bytes=1_048_576,
     secrets=(),
+    validate_response=None,
+    validate_receipt=None,
 ):
-    """One HTTP attempt with asynchronous sink/backpressure and SQLite observation.
+    """One HTTP attempt with asynchronous sink/backpressure and native-ledger observation.
 
-    start_response(status, content_type) and write(bytes) are awaited. The caller
-    must abort its downstream on exceptions; this function never adds SSE markers,
-    retries, redirects, publishes config, or claims a local receipt is a wire contract.
+    start_response(status, content_type) and write(bytes) are awaited. The caller must
+    already have authenticated the request, selected the native configuration and recorded
+    the receipt in the native ledger (``native_begin``); this function always finishes that
+    row. ``ledger`` is the independent native key space: it exposes
+    ``native_is_revoked(identity, version)`` and
+    ``native_finish(receipt, reason, elapsed_ms, upstream_status)``.
+
+    The caller must abort its downstream on exceptions; this function never adds SSE
+    markers, retries, redirects, publishes config, or claims a local receipt is a wire
+    contract.
     """
     if timeout <= 0 or min(max_request_bytes, max_response_bytes) <= 0:
         raise ValueError("positive transport limits required")
     if len(payload) > max_request_bytes:
-        raise Rejected("invalid_input", 413)
+        raise Rejected("payload_too_large", 413)
     body = validate_request(payload)
-    if receipt.get("protocol") != PROTOCOL or receipt.get("resolved_model") != body["model"]:
+    if (
+        receipt.get("protocol") != PROTOCOL
+        or receipt.get("contract") != NATIVE_CONTRACT
+        or type(receipt.get("native_config_version")) is not int
+        or receipt.get("resolved_model") != body["model"]
+    ):
+        # A Chat-shaped or incomplete receipt must never reach the native transport.
         raise Rejected("invalid_input", 400)
     targets.check(base_url)
-    if diagnostics.is_revoked(receipt["config_version"]):
+    identity = native_identity(receipt)
+    if ledger.native_is_revoked(identity, receipt["native_config_version"]):
         raise Rejected("forbidden", 403)
     secrets = (*secrets, credential)
     receipt.update(outcome="unknown", usage=None, native_usage=None, usage_complete=False)
     receipt = redact(receipt, secrets)
-    diagnostics.begin(receipt, None)
     observer = ResponsesObserver()
     upstream_status = None
     reason = "transport_unknown"
@@ -254,6 +270,13 @@ async def send_responses(
                     raw = await read_limited(upstream.content, max_response_bytes)
                     guard.feed(raw, final=True)
                     native = loads(raw)
+                    if validate_response is not None:
+                        try:
+                            validate_response(native)
+                        except Rejected:
+                            # An upstream body outside the published native response shape
+                            # is an unverifiable result, not a new local client error.
+                            raise Rejected("result_unknown", 502, "unknown") from None
                     observer.observe_response(
                         native, native.get("status") if isinstance(native, dict) else None
                     )
@@ -275,8 +298,11 @@ async def send_responses(
     finally:
         record_observation(receipt, observer, complete)
         receipt["observed_at"] = utcnow().isoformat().replace("+00:00", "Z")
-        diagnostics.finish(
-            redact(receipt, secrets),
+        safe_receipt = redact(receipt, secrets)
+        if validate_receipt is not None:
+            validate_receipt(safe_receipt)
+        ledger.native_finish(
+            safe_receipt,
             reason,
             int((time.monotonic() - started) * 1000),
             upstream_status,
