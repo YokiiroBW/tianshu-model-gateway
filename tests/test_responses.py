@@ -338,31 +338,46 @@ class ResponsesHttpTests(unittest.IsolatedAsyncioTestCase):
         await self.send({**BODY, "stream": True})
         self.assertEqual(self.saved()["outcome"], "failed")
 
-    async def test_partial_usage_bad_json_and_nonterminal_json(self):
+    async def test_unparseable_body_fails_closed_and_unobservable_body_is_unknown(self):
         self.raw_response = encode({**NATIVE, "usage": {"input_tokens": 0, "output_tokens": True}})
         await self.send()
         self.assertEqual(self.saved()["usage"], {"input_tokens": 0})
         self.assertFalse(self.saved()["usage_complete"])
-        for raw in (b"{}", b"[]", b'{"id":', encode({**NATIVE, "status": "in_progress"})):
-            self.raw_response = raw
-            with self.assertRaises(Rejected):
+        # A body that cannot even be parsed is a wire-level failure: the attempt fails and
+        # the caller gets a local error instead of unverified bytes.
+        self.raw_response = b'{"id":'
+        with self.assertRaises(Rejected):
+            await self.send()
+        self.assertEqual(self.saved()["outcome"], "unknown")
+        # A body received in full but not confirmable as a native response is delivered
+        # unchanged, with an unknown (never successful) recorded result.
+        for raw in (b"{}", b"[]", encode({**NATIVE, "status": "in_progress"})):
+            with self.subTest(raw=raw):
+                self.raw_response = raw
+                self.chunks.clear()
                 await self.send()
-            self.assertEqual(self.saved()["outcome"], "unknown")
+                self.assertEqual(b"".join(self.chunks), raw)
+                self.assertEqual(self.saved()["outcome"], "unknown")
+                self.assertFalse(self.saved()["usage_complete"])
 
-    async def test_truncation_and_drop_after_terminal_are_unknown(self):
+    async def test_closed_stream_with_unobserved_terminal_is_delivered(self):
         self.mode = "stream"
         self.stream = STREAM[:-2]
-        with self.assertRaises(Rejected):
-            await self.send({**BODY, "stream": True})
+        await self.send({**BODY, "stream": True})
+        # The upstream closed by itself, so the side-channel observer may not truncate it.
+        self.assertEqual(b"".join(self.chunks), self.stream)
         self.assertEqual(self.saved()["outcome"], "unknown")
         self.assertFalse(self.saved()["usage_complete"])
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_real_upstream_drop_still_fails_the_attempt(self):
         self.mode = "drop"
         self.stream = STREAM
         with self.assertRaises(Rejected):
             await self.send({**BODY, "stream": True})
         self.assertEqual(self.saved()["outcome"], "unknown")
         self.assertFalse(self.saved()["usage_complete"])
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 1)
 
     async def test_timeout_cancellation_and_sink_failure_close_upstream(self):
         self.mode = "sse_hold"

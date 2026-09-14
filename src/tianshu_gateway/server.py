@@ -344,8 +344,15 @@ class Gateway:
                 self.provider_active[provider_id] -= 1
 
     async def native_read(self, request):
-        """Receipt read bound to the trusted identity, never to the request ID alone."""
+        """Receipt read bound to the trusted identity, never to the request ID alone.
+
+        A registration that is revoked, expired, unpermitted or carries no native version
+        allowlist is not a usable identity, so it cannot read even its own history. Native
+        *version* revocation is a different concept: it stops new routing and never erases
+        the audit rows, so it is deliberately not consulted here.
+        """
         grant = self.authenticate_native(request)
+        authorize(grant)
         result = self.native_ledger.native_get(grant.identity(), request.match_info["request_id"])
         if result is None:
             raise Rejected("not_found", 404)

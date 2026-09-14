@@ -4,12 +4,17 @@ Everything runs against isolated loopback fixtures (platform substitute plus rec
 upstream). No real platform, model provider, account or paid call is involved.
 """
 
+import asyncio
 import copy
 import importlib.util
 import json
 import os
+import socket
+import subprocess
+import sys
 import tempfile
 import unittest
+from dataclasses import asdict, replace
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -538,13 +543,63 @@ class NativeHttpTests(unittest.IsolatedAsyncioTestCase):
             json=native_body(stream=True),
             headers=self.native_headers(request_id="native-cut", turn="turn-cut"),
         ) as response:
-            with self.assertRaises(aiohttp.ClientPayloadError):
-                await response.read()
+            self.assertEqual(response.status, 200)
+            # The upstream closed by itself: the incomplete observation may not truncate it.
+            self.assertEqual(await response.read(), self.services.native_stream)
         route = await self.read_receipt("native-cut")
         self.assertEqual(route["outcome"], "unknown")
         self.assertFalse(route["usage_complete"])
-        # The upstream had already closed; only the downstream connection was aborted.
         self.assertEqual(len(self.services.native_calls), 3)
+
+    async def test_observer_budget_and_unparseable_events_never_truncate_native_sse(self):
+        self.services.native_mode = "stream"
+        created = native_event(
+            "response.created",
+            response={**self.services.native_response, "status": "in_progress", "usage": None},
+        )
+        completed = native_event("response.completed", response=self.services.native_response)
+        cases = (
+            # An over-budget event exhausts the observer: bytes stay, result is unknown.
+            (
+                "over_budget",
+                native_event("response.output_text.delta", delta="x" * 270000) + completed,
+                "unknown",
+                False,
+            ),
+            # An unknown event type is preserved and does not break a complete stream.
+            (
+                "unknown_event",
+                created + native_event("vendor.future", opaque={"keep": True}) + completed,
+                "succeeded",
+                True,
+            ),
+            # An unparseable event invalidates observation only.
+            (
+                "unparseable_event",
+                created
+                + b"event: response.output_text.delta\r\ndata: not-json\r\n\r\n"
+                + completed,
+                "unknown",
+                False,
+            ),
+        )
+        for label, stream, outcome, usage_complete in cases:
+            with self.subTest(label=label):
+                self.services.native_stream = stream
+                request_id = f"budget-{label}"
+                async with self.client.post(
+                    self.url + NATIVE_PATH,
+                    json=native_body(stream=True),
+                    headers=self.native_headers(request_id=request_id, turn=f"turn-{label}"),
+                ) as response:
+                    self.assertEqual(response.status, 200)
+                    received = await response.read()
+                self.assertEqual(received, stream)
+                route = await self.read_receipt(request_id)
+                self.assertEqual(route["outcome"], outcome)
+                self.assertEqual(route["usage_complete"], usage_complete)
+                # No local event may be appended: the last bytes are the upstream's own.
+                self.assertTrue(received.endswith(stream[-32:]))
 
     async def test_native_upstream_errors_are_raw_and_never_retried(self):
         self.services.native_mode = "error_json"
@@ -815,6 +870,114 @@ class NativeHttpTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 403)
         self.assertEqual(self.services.native_config_calls, [])
 
+    async def test_invalid_registration_cannot_read_receipts_and_version_revocation_keeps_audit(
+        self,
+    ):
+        async with self.client.post(
+            self.url + NATIVE_PATH,
+            json=native_body(stream=False),
+            headers=self.native_headers(request_id="audit-own", turn="audit-turn"),
+        ) as response:
+            self.assertEqual(response.status, 200)
+        # Revoking the native *version* stops new routing but never erases the audit row:
+        # the two concepts are deliberately independent.
+        self.gateway.native_cache.revoke(self.grants[0], 7)
+        route = await self.read_receipt("audit-own")
+        self.assertEqual(route["outcome"], "succeeded")
+        for label, replacement in (
+            ("revoked", replace(self.grants[0], revoked=True)),
+            ("expired", replace(self.grants[0], expires_at="2000-01-01T00:00:00Z")),
+        ):
+            with self.subTest(label=label):
+                settings = copy.copy(self.settings)
+                settings.native_clients = [replacement, *self.grants[1:]]
+                app = create_app(settings)
+                runner, url = await start_http(app)
+                self.addAsyncCleanup(runner.cleanup)
+                # The caller's own historical receipt is refused: an unusable registration
+                # is not an identity, even for rows it wrote itself.
+                async with self.client.get(
+                    url + RECEIPT_PATH + "audit-own",
+                    headers={"Authorization": "Bearer " + SECRETS["TS042_TEST_NATIVE"]},
+                ) as response:
+                    self.assertEqual(response.status, 403)
+                    self.assert_native_error(await response.json(), "forbidden")
+                # Cross-subject isolation for a still-valid caller is unchanged.
+                async with self.client.get(
+                    url + RECEIPT_PATH + "audit-own",
+                    headers={"Authorization": "Bearer " + SECRETS["TS042_TEST_NATIVE_EXTERNAL"]},
+                ) as response:
+                    self.assertEqual(response.status, 404)
+                # New native work is refused as well.
+                async with self.client.post(
+                    url + NATIVE_PATH,
+                    json=native_body(stream=False),
+                    headers=self.native_headers(),
+                ) as response:
+                    self.assertEqual(response.status, 403)
+
+    async def test_native_cli_subprocess_serves_route_from_json_settings(self):
+        """A real CLI start from a deployment JSON document whose arrays are lists."""
+        # Exactly what the CLI parses from disk: dataclasses.asdict keeps tuples, so the
+        # round trip through JSON text is the boundary this test must exercise.
+        document = json.loads(json.dumps(asdict(self.settings)))
+        document["diagnostics_path"] = str(Path(self.temp.name) / "cli-native.sqlite")
+        self.assertIsInstance(document["native_clients"][0]["native_config_versions"], list)
+        self.assertIsInstance(document["native_clients"][0]["provider_ids"], list)
+        path = Path(self.temp.name) / "native-settings.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with socket.socket() as reserved:
+            reserved.bind(("127.0.0.1", 0))
+            port = reserved.getsockname()[1]
+        command = [
+            sys.executable,
+            "-B",
+            "-m",
+            "tianshu_gateway",
+            "--settings",
+            str(path),
+            "--port",
+            str(port),
+            "--local-test",
+        ]
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=flags,
+        )
+        try:
+            async with asyncio.timeout(5):
+                while True:
+                    try:
+                        async with self.client.post(
+                            f"http://127.0.0.1:{port}" + NATIVE_PATH,
+                            json=native_body(stream=False),
+                            headers=self.native_headers(
+                                request_id="cli-native", turn="cli-native-turn"
+                            ),
+                        ) as response:
+                            self.assertEqual(response.status, 200)
+                            break
+                    except aiohttp.ClientConnectorError:
+                        await asyncio.sleep(0.03)
+            async with self.client.get(
+                f"http://127.0.0.1:{port}" + RECEIPT_PATH + "cli-native",
+                headers={"Authorization": "Bearer " + SECRETS["TS042_TEST_NATIVE"]},
+            ) as response:
+                self.assertEqual(response.status, 200)
+                receipt = await response.json()
+            self.assertEqual(receipt["resolved_model"], MODEL)
+            self.assertEqual(receipt["native_config_version"], 7)
+            self.assertIsNone(receipt.get("config_version"))
+        finally:
+            if process.returncode is None:
+                process.terminate()
+            out, error = await asyncio.wait_for(process.communicate(), 5)
+        for secret in SECRETS.values():
+            self.assertNotIn(secret.encode(), out + error)
+
     async def test_state_references_size_and_unknown_targets_fail_before_send(self):
         for update, code, status in (
             ({"previous_response_id": "resp_fixture"}, "state_reference_unsupported", 409),
@@ -903,7 +1066,11 @@ class NativeHttpTests(unittest.IsolatedAsyncioTestCase):
             self.url + RECEIPT_PATH + request_id,
             headers={"Authorization": "Bearer " + SECRETS["TS042_TEST_NATIVE_OTHER"]},
         ) as response:
-            self.assertEqual(response.status, 404)
+            # This registration carries no native version allowlist, so it is not a usable
+            # identity at all: it is refused before any row lookup (never a 200, and not a
+            # 404 that would imply the identity itself were valid).
+            self.assertEqual(response.status, 403)
+            self.assert_native_error(await response.json(), "forbidden")
         async with self.client.get(
             self.url + RECEIPT_PATH + request_id,
             headers={"Authorization": "Bearer " + SECRETS["TS041_TEST_CLIENT"]},

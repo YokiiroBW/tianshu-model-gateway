@@ -56,6 +56,6 @@ git diff --check
 
 `src/tianshu_gateway/native.py` 消费已发布 `model-protocol/v1` 1.0.0，`src/tianshu_gateway/responses.py` 提供原生单次 HTTP 传输与旁路观察器。默认部署不注册 Responses：只有部署显式给出 `native_enabled` 与 `native_contract_directory` 时才注册 `POST /v1/responses` 与 `GET /internal/v1/native-model-requests/{request_id}`，否则该路径返回 501 `unsupported_operation`（native 合同信封）。模型配置仍只由平台发布；native 版本走 `POST /internal/v1/model-config/native/snapshot`，使用独立 native 表、独立 ledger 键空间（contract/principal/caller/namespace），不继承 Chat 版本或 Chat 授权。客户端身份不取请求正文或任意头，只取部署注册的 principal/service/namespace。
 
-`preserve_client` 保留客户端原生 JSON bytes（model/reasoning/store/未知字段），状态引用明确拒绝，无默认回退与自动重放；SSE 仅旁路观察不改字节，断流/取消/超时/落盘失败记 unknown。部署字段与边界见[运行说明](docs/gateway-runtime.md)，内部模块边界见[Responses 说明](docs/responses-internal.md)。
+`preserve_client` 保留客户端原生 JSON bytes（model/reasoning/store/未知字段），状态引用明确拒绝，无默认回退与自动重放；SSE 仅旁路观察不改字节，观察超预算、未知/无法解析事件或缺终态只把记账降级为 unknown 而不截断已收到的字节；只有真正的传输失败、超时、取消、断流与凭据反射才中止尝试。部署 JSON 的列表字段按数组书写，可直接启动真实 CLI。失效注册（撤销/过期/缺权限/无 native 版本授权）读取自己的回执也拒绝，native 版本撤销则保留历史审计。部署字段与边界见[运行说明](docs/gateway-runtime.md)，内部模块边界见[Responses 说明](docs/responses-internal.md)。
 
 本块验证：`.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_responses*.py' -v`（组件、候选包与 native 路由）；旧 Chat 回归沿用 `test_gateway*.py`。静态检查与格式检查覆盖 `src tests/gateway_fixtures.py tests/test_gateway_http.py tests/test_gateway_boundaries.py tests/test_responses.py tests/test_responses_candidate.py tests/test_responses_native.py`。以上只用 loopback 替身，不调用真实模型，也不代表平台生产者或生产接入已验收。

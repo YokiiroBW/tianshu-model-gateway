@@ -104,12 +104,13 @@
 ```
 
 - 路由：`POST /v1/responses`（原生 JSON 或原生 SSE）与 `GET /internal/v1/native-model-requests/{request_id}`。native 关闭时前者返回 501 `unsupported_operation`（native 合同信封），回执路径为 404。
-- 身份：`principal_id`、`caller_service`、`credential_namespace` 只来自 `native_clients` 注册；请求体、`metadata`/`user` 字段或任意客户端头都不构成身份。native 凭据与 Chat 凭据互不通用，注册 `expires_at`/`revoked` 或缺少 `config.snapshot` 权限即拒绝。
+- 身份：`principal_id`、`caller_service`、`credential_namespace` 只来自 `native_clients` 注册；请求体、`metadata`/`user` 字段或任意客户端头都不构成身份。native 凭据与 Chat 凭据互不通用，注册 `expires_at`/`revoked` 或缺少 `config.snapshot` 权限即拒绝。部署 JSON 的列表字段按数组书写（`provider_ids`/`native_config_versions`/`permissions`/`config_versions`），元素类型与版本仍逐个校验；部署文件与 `dataclasses.asdict` 结果可直接互换。
+- 回执读取：仍按 (contract, principal, caller, namespace) 归属校验，跨主体/服务/namespace 一律 404；但**失效注册**（revoked、过期、缺 `config.snapshot` 权限或 `native_config_versions` 为空）不是可用身份，读取自己的历史回执也返回 403。native **版本**撤销是另一件事：它阻止新的选路，但不抹除已有审计行，因此回执读取不查询版本撤销状态。
 - 版本：可信内部服务用 `X-Tianshu-Native-Config-Version`（正整数，须在 `native_config_versions` 内）；外部注册可用部署固定的 `native_config_version`，为 null 时由平台选授权最新版，网关仍会校验返回值在授权集合内。Chat 路由拒绝 native 版本头，native 路由拒绝 Chat 的 `X-Tianshu-Config-Version`/`X-Tianshu-Workload`，两套相同整数不代表同一配置。
 - 配置：`POST {platform_base_url}/internal/v1/model-config/native/snapshot`，`native_config_request` 含 `query`/`native_config_version`/`contract`，origin 引用仍取自 `platform_origin_env`。平台 403/410 会按该主体+版本持久拒绝；5xx 只允许继续使用已验证且未过期的同版缓存；404/关联 ID 不符/窗口过期分别返回 404/409/503，不降到 Chat。
 - 路由与保真：`preserve_client` 只做精确模型匹配（客户端 model 必须等于 provider/binding model，缺失或不同即 400），不补默认、不替换；请求原始 bytes 直发上游 `{base_url}/responses`，只加协议所需 `Content-Type`/`Accept`/`Accept-Encoding: identity` 与单独解析的上游凭据。状态引用（previous_response_id/conversation/prompt/缓存比较 ID/item_reference/文件容器引用）在发送前拒绝。
 - 结果与回执：native 回执只写 `native_config_version` 与 `openai-responses`，不写 Chat 版本或协议；`requested_reasoning`/`effective_reasoning` 只投影原生 reasoning，`applied_policies` 为空，`fallback_used=false`。上游 2xx JSON/SSE bytes 原样回传，上游错误保留状态与安全原生 JSON（不转发 Location/Set-Cookie/Cookie，不套本地信封）。断流、取消、发送后超时、落盘失败记 unknown 且不自动重放；超时诊断 reason 为 `timeout_unknown`。
+- 观察与透传：observer 是旁路。上游正常结束时，观察超预算（每事件 256 KiB）、遇到未知或无法解析事件、或没有终态，都只把记账降级为 unknown（reason `observation_incomplete`），已收到的字节继续完整透传，不截断、不伪造终态、不追加本地事件。只有真正的传输失败（读错误、断流、压缩体、错误 content type、超时、取消、超大、无法解析的正文）与反射凭据才中止尝试。
 - 回执读取按 (contract, principal, caller, namespace) 归属校验，且与 Chat 账本、Chat 撤销链完全分开：撤销 Chat 版本 7 不影响 native 7，反之亦然。
 - 上限沿用现有 `max_request_bytes`/`max_response_bytes`/`max_concurrent`/`max_provider_concurrent`/`max_timeout_ms`，上游总时限取 binding.timeout_ms 与该上限较小值。
-- 验证界限：`tests/test_responses_native.py` 用独立 loopback 端口启动平台替身（同时提供 Chat 与 native 快照）、录制上游与真实网关，覆盖 JSON/SSE 字节保真、发布方 `validate.py` 的 `exchange()` 关系、错误状态、断流/取消/超时、部分/未知/零用量、撤权两个方向、回执隔离、同号不串用与秘密反射；不代表平台生产者已实现、也不代表生产可用。当前接口在根包中仍为 `runtime_disabled_until_joint_acceptance`。
-
+- 验证界限：`tests/test_responses_native.py` 用独立 loopback 端口启动平台替身（同时提供 Chat 与 native 快照）、录制上游与真实网关，并用 `dataclasses.asdict`→JSON 的部署文件启动真实 CLI 子进程；覆盖 JSON/SSE 字节保真、发布方 `validate.py` 的 `exchange()` 关系、错误状态、观察超预算/未知事件不截断、断流/取消/超时、部分/未知/零用量、撤权两个方向、失效身份回执拒绝与版本撤销保留审计、回执隔离、同号不串用与秘密反射；不代表平台生产者已实现、也不代表生产可用。当前接口在根包中仍为 `runtime_disabled_until_joint_acceptance`。

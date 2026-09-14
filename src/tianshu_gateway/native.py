@@ -51,6 +51,15 @@ class NativeGrant:
     revoked: bool = False
     internal: bool = False
 
+    def __post_init__(self):
+        # A deployment file is JSON, so the list-valued fields arrive as arrays. Normalize
+        # only the container here; element, type and version checks stay in validate() and
+        # a malformed container (for example a bare string) is still rejected there.
+        for name in ("provider_ids", "native_config_versions", "permissions", "config_versions"):
+            value = getattr(self, name)
+            if isinstance(value, list):
+                object.__setattr__(self, name, tuple(value))
+
     def identity(self):
         """Native ledger key space: contract plus trusted subject, service and namespace."""
         return (NATIVE_CONTRACT, self.principal_id, self.service, self.credential_namespace)

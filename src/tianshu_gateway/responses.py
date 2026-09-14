@@ -189,6 +189,12 @@ async def send_responses(
     The caller must abort its downstream on exceptions; this function never adds SSE
     markers, retries, redirects, publishes config, or claims a local receipt is a wire
     contract.
+
+    Wire-level failures (unreadable, compressed, oversized or unparseable bodies, wrong
+    content type, timeouts, cancellation, connection loss, reflected credentials) fail the
+    attempt. An observation shortfall is different: once the upstream response has been
+    received in full, the observer may only downgrade the recorded outcome to unknown, so
+    the raw bytes are still delivered unchanged.
     """
     if timeout <= 0 or min(max_request_bytes, max_response_bytes) <= 0:
         raise ValueError("positive transport limits required")
@@ -258,9 +264,11 @@ async def send_responses(
                         if safe:
                             await write(safe)
                     observer.end()
-                    if not observer.complete:
-                        reason = "incomplete_stream"
-                        raise Rejected("result_unknown", 502, "unknown")
+                    # The upstream stream ended by itself, so every byte belongs downstream.
+                    # Observation is a side channel: an observation shortfall (per-event
+                    # budget, unparseable or unknown event, missing terminal) may only mark
+                    # the result unknown. It never truncates a delivered stream and never
+                    # fabricates a terminal event.
                     tail = guard.feed(b"", final=True)
                     if tail:
                         await write(tail)
@@ -270,23 +278,26 @@ async def send_responses(
                     raw = await read_limited(upstream.content, max_response_bytes)
                     guard.feed(raw, final=True)
                     native = loads(raw)
-                    if validate_response is not None:
-                        try:
+                    try:
+                        if validate_response is not None:
                             validate_response(native)
-                        except Rejected:
-                            # An upstream body outside the published native response shape
-                            # is an unverifiable result, not a new local client error.
-                            raise Rejected("result_unknown", 502, "unknown") from None
-                    observer.observe_response(
-                        native, native.get("status") if isinstance(native, dict) else None
-                    )
-                    if not observer.complete:
-                        raise Rejected("result_unknown", 502, "unknown")
+                        observer.observe_response(
+                            native, native.get("status") if isinstance(native, dict) else None
+                        )
+                    except Rejected:
+                        # Received in full but not confirmable as a published native
+                        # response: the bytes stay the upstream's and the result is unknown.
+                        pass
                     await start_response(upstream.status, "application/json")
                     await write(raw)
-                complete = True
-                receipt["outcome"] = TERMINALS[observer.status]
-                reason = "response_" + observer.status
+                if observer.complete:
+                    complete = True
+                    receipt["outcome"] = TERMINALS[observer.status]
+                    reason = "response_" + observer.status
+                else:
+                    # Neither success nor a transport failure: the wire attempt completed
+                    # but the result was not observed, so it stays unknown.
+                    reason = "observation_incomplete"
     except asyncio.CancelledError:
         reason = "cancelled_unknown"
         raise
