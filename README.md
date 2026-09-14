@@ -51,3 +51,9 @@ git diff --check
 离开分配 worktree 后，运行旧源码核对前显式设置 `LEGACY_ROUTING_ROOT` 为相同只读参考检出路径。缺参考目录/依赖会失败，不跳过后报全绿。源文件 SHA-256 存在 `tests/fixtures/legacy-source.json`；不要自动接受变化。
 
 `tests/protocol_lab.py` 是可抛弃的规则实验，`tests/fixtures/native.json` 是人为构造的请求及流式片段，`test_legacy_characterization.py` 执行真实旧规划器。绿色测试同时表示“旧行为得到复现”和“实验符合拟定规则”，不表示旧实现符合 V2。流片段不是完整上游响应录制，虚构模型不证明任何接入商支持这些字段组合。
+
+## TS-042 内部 Responses 模块
+
+`src/tianshu_gateway/responses.py` 提供尚未接入公开路由的原生单次 HTTP 传输和旁路观察器。`/v1/responses` 仍返回 501；模型配置仍只读取平台已发布的 Chat 合同。扩展候选见 `docs/candidates/model-protocol-v1/README.md`，使用边界见 `docs/responses-internal.md`。
+
+本块验证：`.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_responses*.py' -v`；旧 Chat 回归沿用 `test_gateway*.py`。静态检查与格式检查增加 `tests/test_responses.py tests/test_responses_candidate.py`。以上不调用真实模型。

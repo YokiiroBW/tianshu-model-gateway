@@ -23,3 +23,5 @@ TS-040 历史离线实验命令：
 使用 `-B` 防止在只读 references 生成字节码；不得复制旧源码进入本项目。完整命令和本机解释器见 README。旧源码哈希改变必须重审，不自动更新基线。普通网关变更不运行无关旧仓库/全工作区测试。验证需区分组件、HTTP 替身联合、真实平台/模型接入与生产；SQLite 通过不能冒充 PostgreSQL 通过。
 
 本地隔离开发和提交用于审查；不自动推送、部署或操作真实设备。交付短记录 docs/handoffs/<任务编号>.md，含实际变更、验证、风险及下一步。
+
+TS-042：`src/tianshu_gateway/responses.py` 是未注册路由的内部模块；不得用候选 schema 或 Chat 配置开启 Responses。内部验证命令 `.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_responses*.py' -v`；ruff check/format --check 覆盖 src 与两个 test_responses 文件。保持依赖锁与公开 Chat 配置路径原样。正式新包、平台生产者适配、网关认证消费三项都就绪后才单独验收公开路由。

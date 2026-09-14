@@ -1,0 +1,14 @@
+{
+  "status": "candidate_unpublished",
+  "candidate": "TS-042",
+  "version": "1.0.0-candidate.1",
+  "proposed_package": "model-protocol/v1",
+  "platform_baseline": "f4dac45",
+  "gateway_baseline": "b3b101faf3902f05d80818b39fe7c91367865d4e",
+  "dependencies": [
+    "text-dialogue/v1 1.0.0 common.json"
+  ],
+  "producer_confirmation": "pending_platform_increment",
+  "consumer_confirmation": "offline_candidate_only",
+  "enabled_runtime_routes": []
+}

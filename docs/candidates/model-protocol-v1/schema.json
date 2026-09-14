@@ -1,0 +1,553 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.tianshu.invalid/model-protocol/v1/model.json",
+  "$comment": "TS-042 candidate only; not published and not an enabled route. Native shape requires semantic state-reference checks.",
+  "$defs": {
+    "config_request": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/query"
+        },
+        "config_version": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "contract": {
+          "const": "model-protocol/v1"
+        }
+      },
+      "required": [
+        "query",
+        "config_version",
+        "contract"
+      ],
+      "additionalProperties": false
+    },
+    "provider": {
+      "type": "object",
+      "properties": {
+        "provider_id": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/id"
+        },
+        "base_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://"
+        },
+        "credential_ref": {
+          "type": "string",
+          "pattern": "^secret-ref:[A-Za-z0-9._/-]+$"
+        },
+        "protocol": {
+          "const": "openai-responses"
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capability_verification": {
+          "enum": [
+            "fixture_only",
+            "verified_test_account"
+          ]
+        },
+        "verified_capabilities": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "text",
+              "stream",
+              "tools",
+              "reasoning"
+            ]
+          },
+          "minItems": 0
+        },
+        "credential_namespace": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/id"
+        },
+        "model_policy": {
+          "$ref": "#/$defs/model_policy"
+        },
+        "reasoning_policy": {
+          "$ref": "#/$defs/reasoning_policy"
+        },
+        "state_references": {
+          "const": "reject"
+        }
+      },
+      "required": [
+        "provider_id",
+        "base_url",
+        "credential_ref",
+        "protocol",
+        "model_id",
+        "capability_verification",
+        "verified_capabilities",
+        "credential_namespace",
+        "model_policy",
+        "reasoning_policy",
+        "state_references"
+      ],
+      "additionalProperties": false
+    },
+    "binding": {
+      "type": "object",
+      "properties": {
+        "workload": {
+          "const": "native.responses"
+        },
+        "provider_id": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/id"
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "fallback": {
+          "const": "disabled"
+        }
+      },
+      "required": [
+        "workload",
+        "provider_id",
+        "model_id",
+        "timeout_ms",
+        "fallback"
+      ],
+      "additionalProperties": false
+    },
+    "config_response": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "request_id": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/id"
+        },
+        "config_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "published"
+        },
+        "published_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "usable_until": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/provider"
+          },
+          "minItems": 1
+        },
+        "bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/binding"
+          },
+          "minItems": 1
+        },
+        "contract": {
+          "const": "model-protocol/v1"
+        }
+      },
+      "required": [
+        "schema_version",
+        "request_id",
+        "config_version",
+        "status",
+        "published_at",
+        "usable_until",
+        "providers",
+        "bindings",
+        "contract"
+      ],
+      "additionalProperties": false
+    },
+    "route_context": {
+      "type": "object",
+      "properties": {
+        "request_id": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/id"
+        },
+        "turn_id": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/id"
+        },
+        "config_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "workload": {
+          "const": "native.responses"
+        },
+        "protocol": {
+          "const": "openai-responses"
+        },
+        "contract": {
+          "const": "model-protocol/v1"
+        },
+        "caller_service": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "principal_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "credential_namespace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      },
+      "required": [
+        "request_id",
+        "turn_id",
+        "config_version",
+        "workload",
+        "protocol",
+        "contract",
+        "caller_service",
+        "principal_id",
+        "credential_namespace"
+      ],
+      "additionalProperties": false
+    },
+    "route_receipt": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "request_id": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/id"
+        },
+        "config_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "provider_id": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/id"
+        },
+        "requested_model": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resolved_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "protocol": {
+          "const": "openai-responses"
+        },
+        "outcome": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "unknown"
+          ]
+        },
+        "upstream_request_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "input_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "output_tokens": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [],
+              "additionalProperties": false,
+              "minProperties": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fallback_used": {
+          "const": false
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "credential_namespace": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/id"
+        },
+        "caller_service": {
+          "$ref": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json#/$defs/id"
+        },
+        "requested_reasoning": {
+          "type": "object"
+        },
+        "effective_reasoning": {
+          "type": "object"
+        },
+        "applied_policies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string",
+                "minLength": 1
+              },
+              "mode": {
+                "enum": [
+                  "default_if_absent",
+                  "force",
+                  "workload_binding"
+                ]
+              },
+              "config_version": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "required": [
+              "field",
+              "mode",
+              "config_version"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 0
+        },
+        "usage_complete": {
+          "type": "boolean"
+        },
+        "native_usage": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "contract": {
+          "const": "model-protocol/v1"
+        },
+        "principal_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "response_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      },
+      "required": [
+        "schema_version",
+        "request_id",
+        "config_version",
+        "provider_id",
+        "requested_model",
+        "resolved_model",
+        "protocol",
+        "outcome",
+        "upstream_request_id",
+        "usage",
+        "fallback_used",
+        "observed_at",
+        "credential_namespace",
+        "caller_service",
+        "requested_reasoning",
+        "effective_reasoning",
+        "applied_policies",
+        "usage_complete",
+        "native_usage",
+        "contract",
+        "principal_id",
+        "response_id"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "usage_complete": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "usage": {
+                "type": "object",
+                "required": [
+                  "input_tokens",
+                  "output_tokens"
+                ]
+              },
+              "native_usage": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "model_policy": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "const": "preserve_client"
+        },
+        "fields": {
+          "type": "object",
+          "maxProperties": 0
+        }
+      },
+      "required": [
+        "mode",
+        "fields"
+      ],
+      "additionalProperties": false
+    },
+    "reasoning_policy": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "const": "preserve_client"
+        },
+        "fields": {
+          "type": "object",
+          "maxProperties": 0
+        }
+      },
+      "required": [
+        "mode",
+        "fields"
+      ],
+      "additionalProperties": false
+    },
+    "native_request": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input": {
+          "type": [
+            "string",
+            "array"
+          ]
+        },
+        "stream": {
+          "type": "boolean"
+        },
+        "background": {
+          "const": false
+        },
+        "previous_response_id": {
+          "type": "null"
+        },
+        "conversation": {
+          "type": "null"
+        },
+        "prompt": {
+          "type": "null"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "enum": [
+                  "function",
+                  "custom"
+                ]
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "model",
+        "input"
+      ],
+      "additionalProperties": true
+    },
+    "upstream_request": {
+      "$ref": "#/$defs/native_request"
+    },
+    "native_response": {
+      "type": "object",
+      "properties": {
+        "object": {
+          "const": "response"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "object",
+        "id"
+      ],
+      "additionalProperties": true
+    }
+  }
+}
