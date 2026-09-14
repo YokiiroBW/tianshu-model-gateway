@@ -1,0 +1,99 @@
+{
+  "contract": "model-protocol/v1",
+  "version": "1.0.0",
+  "status": "release_ready_unpublished",
+  "configuration_owner": "platform.Models",
+  "dependency": {
+    "schema": "text-dialogue/v1/common.json",
+    "sha256": "b296a79d7eb0218d9b444c4ddbba837ad576f46a7a4e50fbcebec7618d8ef9af"
+  },
+  "interfaces": [
+    {
+      "id": "platform.native-model-config.snapshot",
+      "owner": "platform.Models",
+      "method": "POST",
+      "path": "/internal/v1/model-config/native/snapshot",
+      "request": "model#config_request",
+      "response": "model#config_response",
+      "error": "model#error",
+      "status": "runtime_disabled_until_joint_acceptance",
+      "authorization": {
+        "service_permission": "config.snapshot",
+        "version_allowlist": "caller.native_config_versions",
+        "missing_allowlist": "deny",
+        "legacy_allowlist_inheritance": false,
+        "trusted_origin_required": true
+      },
+      "selection": {
+        "explicit_version": "native_config_version; authorized, published, unrevoked, unexpired only",
+        "null_version": "maximum native_config_version among caller-authorized published unrevoked unexpired native snapshots",
+        "legacy_fallback": false,
+        "infer_protocol_from_body": false
+      }
+    },
+    {
+      "id": "gateway.native-responses.create",
+      "owner": "gateway",
+      "method": "POST",
+      "path": "/v1/responses",
+      "request": "model#native_request",
+      "response": [
+        "model#native_response",
+        "raw.native-sse",
+        "raw.native-upstream-error"
+      ],
+      "error": "model#error",
+      "status": "runtime_disabled_until_joint_acceptance",
+      "authorization": {
+        "authenticated_caller_required": true,
+        "native_config_version_required": true,
+        "route_context_source": "gateway trusted authentication and authorized platform snapshot; never caller body"
+      },
+      "execution": {
+        "protocol": "openai-responses",
+        "workload": "native.responses",
+        "state_references": "reject",
+        "fallback": "disabled",
+        "automatic_replay": false,
+        "observer": "side-channel; response bytes unchanged"
+      }
+    },
+    {
+      "id": "gateway.native-model-requests.read",
+      "owner": "gateway",
+      "method": "GET",
+      "path": "/internal/v1/native-model-requests/{request_id}",
+      "response": "model#route_receipt",
+      "error": "model#error",
+      "status": "runtime_disabled_until_joint_acceptance",
+      "authorization": {
+        "authenticated_caller_required": true,
+        "scope": [
+          "principal_id",
+          "caller_service",
+          "credential_namespace"
+        ],
+        "request_ownership_required": true,
+        "request_id_is_not_authorization": true
+      }
+    }
+  ],
+  "internal_projections": [
+    {
+      "id": "gateway.native-route-context",
+      "schema": "model#route_context",
+      "owner": "gateway",
+      "http_route": null,
+      "source": "trusted authentication plus authorized native configuration",
+      "untrusted_sources_prohibited": [
+        "client request body",
+        "model metadata",
+        "arbitrary client identity headers"
+      ]
+    }
+  ],
+  "raw_types": {
+    "raw.native-sse": "Unmodified native SSE bytes; never insert local JSON errors after headers.",
+    "raw.native-upstream-error": "Original upstream HTTP status and safe native JSON; no local error envelope; no Location, Set-Cookie or Cookie headers."
+  }
+}

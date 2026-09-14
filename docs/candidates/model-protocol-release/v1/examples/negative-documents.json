@@ -1,0 +1,313 @@
+[
+  {
+    "id": "legacy_version_not_native",
+    "schema": "config_request",
+    "document": {
+      "query": {
+        "schema_version": 1,
+        "request_id": "request-fixture",
+        "origin": {
+          "assertion_ref": "origin-fixture"
+        }
+      },
+      "contract": "model-protocol/v1",
+      "config_version": 7
+    }
+  },
+  {
+    "id": "legacy_protocol",
+    "schema": "config_response",
+    "document": {
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "native_config_version": 7,
+      "status": "published",
+      "published_at": "2026-09-14T00:00:00Z",
+      "usable_until": "2026-09-14T00:05:00Z",
+      "providers": [
+        {
+          "provider_id": "provider-fixture",
+          "base_url": "https://upstream.example.invalid/v1",
+          "credential_ref": "secret-ref:fixture/provider-a",
+          "credential_namespace": "credential-namespace-fixture",
+          "protocol": "openai-chat-completions",
+          "model_id": "fixture-text-model",
+          "capability_verification": "fixture_only",
+          "verified_capabilities": [
+            "text",
+            "stream",
+            "tools",
+            "reasoning"
+          ],
+          "model_policy": {
+            "mode": "preserve_client",
+            "fields": {}
+          },
+          "reasoning_policy": {
+            "mode": "preserve_client",
+            "fields": {}
+          },
+          "state_references": "reject"
+        }
+      ],
+      "bindings": [
+        {
+          "workload": "native.responses",
+          "provider_id": "provider-fixture",
+          "model_id": "fixture-text-model",
+          "timeout_ms": 30000,
+          "fallback": "disabled"
+        }
+      ],
+      "contract": "model-protocol/v1"
+    }
+  },
+  {
+    "id": "force_policy_forbidden",
+    "schema": "config_response",
+    "document": {
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "native_config_version": 7,
+      "status": "published",
+      "published_at": "2026-09-14T00:00:00Z",
+      "usable_until": "2026-09-14T00:05:00Z",
+      "providers": [
+        {
+          "provider_id": "provider-fixture",
+          "base_url": "https://upstream.example.invalid/v1",
+          "credential_ref": "secret-ref:fixture/provider-a",
+          "credential_namespace": "credential-namespace-fixture",
+          "protocol": "openai-responses",
+          "model_id": "fixture-text-model",
+          "capability_verification": "fixture_only",
+          "verified_capabilities": [
+            "text",
+            "stream",
+            "tools",
+            "reasoning"
+          ],
+          "model_policy": {
+            "mode": "force",
+            "fields": {
+              "model": "changed"
+            }
+          },
+          "reasoning_policy": {
+            "mode": "preserve_client",
+            "fields": {}
+          },
+          "state_references": "reject"
+        }
+      ],
+      "bindings": [
+        {
+          "workload": "native.responses",
+          "provider_id": "provider-fixture",
+          "model_id": "fixture-text-model",
+          "timeout_ms": 30000,
+          "fallback": "disabled"
+        }
+      ],
+      "contract": "model-protocol/v1"
+    }
+  },
+  {
+    "id": "store_not_boolean",
+    "schema": "native_request",
+    "document": {
+      "model": "fixture-text-model",
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Read only fixture"
+            }
+          ]
+        }
+      ],
+      "instructions": "Fixture instructions",
+      "tools": [
+        {
+          "type": "function",
+          "name": "fixture_read",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "reasoning": {
+        "effort": "medium",
+        "x_fixture": false
+      },
+      "stream": true,
+      "x_fixture_extension": {
+        "keep": 0
+      },
+      "store": null
+    }
+  },
+  {
+    "id": "background_not_supported",
+    "schema": "native_request",
+    "document": {
+      "model": "fixture-text-model",
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Read only fixture"
+            }
+          ]
+        }
+      ],
+      "instructions": "Fixture instructions",
+      "tools": [
+        {
+          "type": "function",
+          "name": "fixture_read",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "reasoning": {
+        "effort": "medium",
+        "x_fixture": false
+      },
+      "stream": true,
+      "x_fixture_extension": {
+        "keep": 0
+      },
+      "background": true
+    }
+  },
+  {
+    "id": "tools_not_converted",
+    "schema": "native_request",
+    "document": {
+      "model": "fixture-text-model",
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Read only fixture"
+            }
+          ]
+        }
+      ],
+      "instructions": "Fixture instructions",
+      "tools": [
+        {
+          "type": "file_search"
+        }
+      ],
+      "reasoning": {
+        "effort": "medium",
+        "x_fixture": false
+      },
+      "stream": true,
+      "x_fixture_extension": {
+        "keep": 0
+      }
+    }
+  },
+  {
+    "id": "response_status_required",
+    "schema": "native_response",
+    "document": {
+      "object": "response",
+      "id": "resp-fixture",
+      "output": [],
+      "usage": null
+    }
+  },
+  {
+    "id": "context_body_claim_extra",
+    "schema": "route_context",
+    "document": {
+      "request_id": "request-fixture",
+      "turn_id": "turn-fixture-1",
+      "native_config_version": 7,
+      "workload": "native.responses",
+      "protocol": "openai-responses",
+      "contract": "model-protocol/v1",
+      "principal_id": "principal-fixture",
+      "caller_service": "caller-fixture",
+      "credential_namespace": "credential-namespace-fixture",
+      "user": {
+        "id": "spoof"
+      }
+    }
+  },
+  {
+    "id": "receipt_incomplete_usage",
+    "schema": "route_receipt",
+    "document": {
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "native_config_version": 7,
+      "provider_id": "provider-fixture",
+      "credential_namespace": "credential-namespace-fixture",
+      "caller_service": "caller-fixture",
+      "requested_model": "fixture-text-model",
+      "resolved_model": "fixture-text-model",
+      "requested_reasoning": {
+        "reasoning": {
+          "effort": "medium",
+          "x_fixture": false
+        }
+      },
+      "effective_reasoning": {
+        "reasoning": {
+          "effort": "medium",
+          "x_fixture": false
+        }
+      },
+      "applied_policies": [],
+      "protocol": "openai-responses",
+      "outcome": "succeeded",
+      "upstream_request_id": "upstream-fixture",
+      "usage": null,
+      "usage_complete": true,
+      "fallback_used": false,
+      "observed_at": "2026-09-14T00:00:10Z",
+      "native_usage": null,
+      "contract": "model-protocol/v1",
+      "principal_id": "principal-fixture",
+      "response_id": "resp-fixture"
+    }
+  },
+  {
+    "id": "unknown_cannot_be_not_started",
+    "schema": "error",
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "result_unknown",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "replay_not_permitted",
+    "schema": "error",
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "result_unknown",
+      "execution_state": "unknown",
+      "retryable": true
+    }
+  }
+]

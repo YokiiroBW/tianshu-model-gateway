@@ -1,0 +1,1506 @@
+{
+  "base": {
+    "now": "2026-09-14T00:00:10Z",
+    "auth": {
+      "caller_service": "caller-fixture",
+      "principal_id": "principal-fixture",
+      "credential_namespace": "credential-namespace-fixture",
+      "assertion_ref": "origin-fixture",
+      "native_config_versions": [
+        7
+      ],
+      "config_versions": [
+        999
+      ],
+      "provider_ids": [
+        "provider-fixture"
+      ],
+      "permissions": [
+        "config.snapshot"
+      ],
+      "expires_at": "2026-09-14T00:10:00Z",
+      "revoked": false
+    },
+    "request": {
+      "query": {
+        "schema_version": 1,
+        "request_id": "request-fixture",
+        "origin": {
+          "assertion_ref": "origin-fixture"
+        }
+      },
+      "native_config_version": 7,
+      "contract": "model-protocol/v1"
+    },
+    "snapshots": [
+      {
+        "schema_version": 1,
+        "request_id": "request-fixture",
+        "native_config_version": 7,
+        "status": "published",
+        "published_at": "2026-09-14T00:00:00Z",
+        "usable_until": "2026-09-14T00:05:00Z",
+        "providers": [
+          {
+            "provider_id": "provider-fixture",
+            "base_url": "https://upstream.example.invalid/v1",
+            "credential_ref": "secret-ref:fixture/provider-a",
+            "credential_namespace": "credential-namespace-fixture",
+            "protocol": "openai-responses",
+            "model_id": "fixture-text-model",
+            "capability_verification": "fixture_only",
+            "verified_capabilities": [
+              "text",
+              "stream",
+              "tools",
+              "reasoning"
+            ],
+            "model_policy": {
+              "mode": "preserve_client",
+              "fields": {}
+            },
+            "reasoning_policy": {
+              "mode": "preserve_client",
+              "fields": {}
+            },
+            "state_references": "reject"
+          }
+        ],
+        "bindings": [
+          {
+            "workload": "native.responses",
+            "provider_id": "provider-fixture",
+            "model_id": "fixture-text-model",
+            "timeout_ms": 30000,
+            "fallback": "disabled"
+          }
+        ],
+        "contract": "model-protocol/v1"
+      }
+    ],
+    "chat_snapshots": [
+      {
+        "config_version": 999,
+        "status": "published"
+      }
+    ],
+    "revoked_native_versions": [],
+    "context": {
+      "request_id": "request-fixture",
+      "turn_id": "turn-fixture-1",
+      "native_config_version": 7,
+      "workload": "native.responses",
+      "protocol": "openai-responses",
+      "contract": "model-protocol/v1",
+      "principal_id": "principal-fixture",
+      "caller_service": "caller-fixture",
+      "credential_namespace": "credential-namespace-fixture"
+    },
+    "native_request": {
+      "model": "fixture-text-model",
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Read only fixture"
+            }
+          ]
+        }
+      ],
+      "instructions": "Fixture instructions",
+      "tools": [
+        {
+          "type": "function",
+          "name": "fixture_read",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "reasoning": {
+        "effort": "medium",
+        "x_fixture": false
+      },
+      "stream": true,
+      "x_fixture_extension": {
+        "keep": 0
+      }
+    },
+    "native_response": {
+      "object": "response",
+      "id": "resp-fixture",
+      "status": "completed",
+      "output": [],
+      "usage": null
+    },
+    "receipt": {
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "native_config_version": 7,
+      "provider_id": "provider-fixture",
+      "credential_namespace": "credential-namespace-fixture",
+      "caller_service": "caller-fixture",
+      "requested_model": "fixture-text-model",
+      "resolved_model": "fixture-text-model",
+      "requested_reasoning": {
+        "reasoning": {
+          "effort": "medium",
+          "x_fixture": false
+        }
+      },
+      "effective_reasoning": {
+        "reasoning": {
+          "effort": "medium",
+          "x_fixture": false
+        }
+      },
+      "applied_policies": [],
+      "protocol": "openai-responses",
+      "outcome": "succeeded",
+      "upstream_request_id": "upstream-fixture",
+      "usage": null,
+      "usage_complete": false,
+      "fallback_used": false,
+      "observed_at": "2026-09-14T00:00:10Z",
+      "native_usage": null,
+      "contract": "model-protocol/v1",
+      "principal_id": "principal-fixture",
+      "response_id": "resp-fixture"
+    },
+    "observation": {
+      "transport_complete": true,
+      "terminal": true,
+      "status": "completed"
+    },
+    "upstream_request": {
+      "model": "fixture-text-model",
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Read only fixture"
+            }
+          ]
+        }
+      ],
+      "instructions": "Fixture instructions",
+      "tools": [
+        {
+          "type": "function",
+          "name": "fixture_read",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "reasoning": {
+        "effort": "medium",
+        "x_fixture": false
+      },
+      "stream": true,
+      "x_fixture_extension": {
+        "keep": 0
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "pinned_native_7",
+      "expected_error": null,
+      "changes": []
+    },
+    {
+      "id": "native_latest_ignores_chat_999",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "request",
+            "native_config_version"
+          ],
+          "value": null
+        }
+      ]
+    },
+    {
+      "id": "legacy_grant_not_inherited",
+      "expected_error": "forbidden",
+      "changes": [
+        {
+          "path": [
+            "auth",
+            "native_config_versions"
+          ],
+          "value": []
+        },
+        {
+          "path": [
+            "auth",
+            "config_versions",
+            0
+          ],
+          "value": 7
+        }
+      ]
+    },
+    {
+      "id": "latest_requires_native_grant",
+      "expected_error": "forbidden",
+      "changes": [
+        {
+          "path": [
+            "auth",
+            "native_config_versions"
+          ],
+          "value": []
+        },
+        {
+          "path": [
+            "request",
+            "native_config_version"
+          ],
+          "value": null
+        }
+      ]
+    },
+    {
+      "id": "unknown_native_version",
+      "expected_error": "not_found",
+      "changes": [
+        {
+          "path": [
+            "auth",
+            "native_config_versions",
+            0
+          ],
+          "value": 8
+        },
+        {
+          "path": [
+            "request",
+            "native_config_version"
+          ],
+          "value": 8
+        }
+      ]
+    },
+    {
+      "id": "revoked_native_7",
+      "expected_error": "forbidden",
+      "changes": [
+        {
+          "path": [
+            "revoked_native_versions",
+            0
+          ],
+          "value": 7
+        }
+      ]
+    },
+    {
+      "id": "expired_at_boundary",
+      "expected_error": "dependency_unavailable",
+      "changes": [
+        {
+          "path": [
+            "now"
+          ],
+          "value": "2026-09-14T00:05:00Z"
+        }
+      ]
+    },
+    {
+      "id": "auth_expired",
+      "expected_error": "forbidden",
+      "changes": [
+        {
+          "path": [
+            "auth",
+            "expires_at"
+          ],
+          "value": "2026-09-14T00:00:10Z"
+        }
+      ]
+    },
+    {
+      "id": "auth_revoked",
+      "expected_error": "forbidden",
+      "changes": [
+        {
+          "path": [
+            "auth",
+            "revoked"
+          ],
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "missing_permission",
+      "expected_error": "forbidden",
+      "changes": [
+        {
+          "path": [
+            "auth",
+            "permissions"
+          ],
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "origin_mismatch",
+      "expected_error": "forbidden",
+      "changes": [
+        {
+          "path": [
+            "request",
+            "query",
+            "origin",
+            "assertion_ref"
+          ],
+          "value": "spoof"
+        }
+      ]
+    },
+    {
+      "id": "config_response_wrong_request",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "snapshots",
+            0,
+            "request_id"
+          ],
+          "value": "wrong"
+        }
+      ]
+    },
+    {
+      "id": "body_principal_does_not_authorize",
+      "expected_error": "forbidden",
+      "changes": [
+        {
+          "path": [
+            "context",
+            "principal_id"
+          ],
+          "value": "spoof"
+        },
+        {
+          "path": [
+            "native_request",
+            "user"
+          ],
+          "value": "spoof"
+        },
+        {
+          "path": [
+            "native_request",
+            "metadata"
+          ],
+          "value": {
+            "principal_id": "spoof"
+          }
+        },
+        {
+          "path": [
+            "upstream_request",
+            "user"
+          ],
+          "value": "spoof"
+        },
+        {
+          "path": [
+            "upstream_request",
+            "metadata"
+          ],
+          "value": {
+            "principal_id": "spoof"
+          }
+        }
+      ]
+    },
+    {
+      "id": "native_business_metadata_preserved",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "native_request",
+            "metadata"
+          ],
+          "value": {
+            "principal_id": "business",
+            "file_id": "business"
+          }
+        },
+        {
+          "path": [
+            "upstream_request",
+            "metadata"
+          ],
+          "value": {
+            "principal_id": "business",
+            "file_id": "business"
+          }
+        }
+      ]
+    },
+    {
+      "id": "namespace_mismatch",
+      "expected_error": "forbidden",
+      "changes": [
+        {
+          "path": [
+            "context",
+            "credential_namespace"
+          ],
+          "value": "other"
+        }
+      ]
+    },
+    {
+      "id": "provider_not_granted",
+      "expected_error": "forbidden",
+      "changes": [
+        {
+          "path": [
+            "auth",
+            "provider_ids"
+          ],
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "model_mismatch_rejected",
+      "expected_error": "invalid_input",
+      "changes": [
+        {
+          "path": [
+            "native_request",
+            "model"
+          ],
+          "value": "changed"
+        },
+        {
+          "path": [
+            "upstream_request",
+            "model"
+          ],
+          "value": "changed"
+        }
+      ]
+    },
+    {
+      "id": "receipt_reasoning_rewrite",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "receipt",
+            "effective_reasoning",
+            "reasoning",
+            "x_fixture"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "receipt",
+            "effective_reasoning",
+            "reasoning",
+            "effort"
+          ],
+          "value": "low"
+        }
+      ]
+    },
+    {
+      "id": "receipt_version_mismatch",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "receipt",
+            "native_config_version"
+          ],
+          "value": 8
+        }
+      ]
+    },
+    {
+      "id": "duplicate_providers",
+      "expected_error": "invalid_input",
+      "changes": [
+        {
+          "path": [
+            "snapshots",
+            0,
+            "providers",
+            1
+          ],
+          "value": {
+            "provider_id": "provider-fixture",
+            "base_url": "https://upstream.example.invalid/v1",
+            "credential_ref": "secret-ref:fixture/provider-a",
+            "credential_namespace": "credential-namespace-fixture",
+            "protocol": "openai-responses",
+            "model_id": "fixture-text-model",
+            "capability_verification": "fixture_only",
+            "verified_capabilities": [
+              "text",
+              "stream",
+              "tools",
+              "reasoning"
+            ],
+            "model_policy": {
+              "mode": "preserve_client",
+              "fields": {}
+            },
+            "reasoning_policy": {
+              "mode": "preserve_client",
+              "fields": {}
+            },
+            "state_references": "reject"
+          }
+        }
+      ]
+    },
+    {
+      "id": "duplicate_workloads",
+      "expected_error": "invalid_input",
+      "changes": [
+        {
+          "path": [
+            "snapshots",
+            0,
+            "bindings",
+            1
+          ],
+          "value": {
+            "workload": "native.responses",
+            "provider_id": "provider-fixture",
+            "model_id": "fixture-text-model",
+            "timeout_ms": 30000,
+            "fallback": "disabled"
+          }
+        }
+      ]
+    },
+    {
+      "id": "dangling_binding",
+      "expected_error": "invalid_input",
+      "changes": [
+        {
+          "path": [
+            "snapshots",
+            0,
+            "bindings",
+            0,
+            "provider_id"
+          ],
+          "value": "unknown"
+        }
+      ]
+    },
+    {
+      "id": "binding_model_mismatch",
+      "expected_error": "invalid_input",
+      "changes": [
+        {
+          "path": [
+            "snapshots",
+            0,
+            "bindings",
+            0,
+            "model_id"
+          ],
+          "value": "changed"
+        }
+      ]
+    },
+    {
+      "id": "immutable_native_version",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "snapshots",
+            1
+          ],
+          "value": {
+            "schema_version": 1,
+            "request_id": "request-fixture",
+            "native_config_version": 7,
+            "status": "published",
+            "published_at": "2026-09-14T00:00:00Z",
+            "usable_until": "2026-09-14T00:05:00Z",
+            "providers": [
+              {
+                "provider_id": "provider-fixture",
+                "base_url": "https://changed.invalid/v1",
+                "credential_ref": "secret-ref:fixture/provider-a",
+                "credential_namespace": "credential-namespace-fixture",
+                "protocol": "openai-responses",
+                "model_id": "fixture-text-model",
+                "capability_verification": "fixture_only",
+                "verified_capabilities": [
+                  "text",
+                  "stream",
+                  "tools",
+                  "reasoning"
+                ],
+                "model_policy": {
+                  "mode": "preserve_client",
+                  "fields": {}
+                },
+                "reasoning_policy": {
+                  "mode": "preserve_client",
+                  "fields": {}
+                },
+                "state_references": "reject"
+              }
+            ],
+            "bindings": [
+              {
+                "workload": "native.responses",
+                "provider_id": "provider-fixture",
+                "model_id": "fixture-text-model",
+                "timeout_ms": 30000,
+                "fallback": "disabled"
+              }
+            ],
+            "contract": "model-protocol/v1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "previous_response_rejected",
+      "expected_error": "state_reference_unsupported",
+      "changes": [
+        {
+          "path": [
+            "native_request",
+            "previous_response_id"
+          ],
+          "value": "resp-old"
+        },
+        {
+          "path": [
+            "upstream_request",
+            "previous_response_id"
+          ],
+          "value": "resp-old"
+        }
+      ]
+    },
+    {
+      "id": "cache_reference_rejected",
+      "expected_error": "state_reference_unsupported",
+      "changes": [
+        {
+          "path": [
+            "native_request",
+            "prompt_cache_options"
+          ],
+          "value": {
+            "comparison_response_id": "resp-old"
+          }
+        },
+        {
+          "path": [
+            "upstream_request",
+            "prompt_cache_options"
+          ],
+          "value": {
+            "comparison_response_id": "resp-old"
+          }
+        }
+      ]
+    },
+    {
+      "id": "item_reference_rejected",
+      "expected_error": "state_reference_unsupported",
+      "changes": [
+        {
+          "path": [
+            "native_request",
+            "input",
+            0,
+            "role"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "native_request",
+            "input",
+            0,
+            "content"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "native_request",
+            "input",
+            0,
+            "id"
+          ],
+          "value": "item-old"
+        },
+        {
+          "path": [
+            "upstream_request",
+            "input",
+            0,
+            "role"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "upstream_request",
+            "input",
+            0,
+            "content"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "upstream_request",
+            "input",
+            0,
+            "id"
+          ],
+          "value": "item-old"
+        }
+      ]
+    },
+    {
+      "id": "tool_schema_reference_name_allowed",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "native_request",
+            "tools",
+            0,
+            "parameters",
+            "properties",
+            "file_id"
+          ],
+          "value": {
+            "type": "string"
+          }
+        },
+        {
+          "path": [
+            "upstream_request",
+            "tools",
+            0,
+            "parameters",
+            "properties",
+            "file_id"
+          ],
+          "value": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    {
+      "id": "input_file_rejected",
+      "expected_error": "unsupported_operation",
+      "changes": [
+        {
+          "path": [
+            "native_request",
+            "input",
+            0,
+            "content",
+            0,
+            "text"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "native_request",
+            "input",
+            0,
+            "content",
+            0,
+            "type"
+          ],
+          "value": "input_file"
+        },
+        {
+          "path": [
+            "native_request",
+            "input",
+            0,
+            "content",
+            0,
+            "file_data"
+          ],
+          "value": "inline"
+        },
+        {
+          "path": [
+            "upstream_request",
+            "input",
+            0,
+            "content",
+            0,
+            "text"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "upstream_request",
+            "input",
+            0,
+            "content",
+            0,
+            "type"
+          ],
+          "value": "input_file"
+        },
+        {
+          "path": [
+            "upstream_request",
+            "input",
+            0,
+            "content",
+            0,
+            "file_data"
+          ],
+          "value": "inline"
+        }
+      ]
+    },
+    {
+      "id": "cancelled_not_success",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "observation",
+            "transport_complete"
+          ],
+          "value": false
+        }
+      ]
+    },
+    {
+      "id": "missing_usage_not_zero",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "receipt",
+            "usage"
+          ],
+          "value": {
+            "input_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "response_id_mismatch",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "receipt",
+            "response_id"
+          ],
+          "value": "resp-other"
+        }
+      ]
+    },
+    {
+      "id": "failed",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "native_response",
+            "status"
+          ],
+          "value": "failed"
+        },
+        {
+          "path": [
+            "receipt",
+            "outcome"
+          ],
+          "value": "failed"
+        },
+        {
+          "path": [
+            "observation",
+            "status"
+          ],
+          "value": "failed"
+        }
+      ]
+    },
+    {
+      "id": "incomplete",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "native_response",
+            "status"
+          ],
+          "value": "incomplete"
+        },
+        {
+          "path": [
+            "receipt",
+            "outcome"
+          ],
+          "value": "unknown"
+        },
+        {
+          "path": [
+            "observation",
+            "status"
+          ],
+          "value": "incomplete"
+        }
+      ]
+    },
+    {
+      "id": "unknown_transport_honest",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "receipt",
+            "outcome"
+          ],
+          "value": "unknown"
+        },
+        {
+          "path": [
+            "observation",
+            "transport_complete"
+          ],
+          "value": false
+        }
+      ]
+    },
+    {
+      "id": "preserve_store_false",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "native_request",
+            "store"
+          ],
+          "value": false
+        },
+        {
+          "path": [
+            "upstream_request",
+            "store"
+          ],
+          "value": false
+        }
+      ]
+    },
+    {
+      "id": "preserve_store_true",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "native_request",
+            "store"
+          ],
+          "value": true
+        },
+        {
+          "path": [
+            "upstream_request",
+            "store"
+          ],
+          "value": true
+        }
+      ]
+    },
+    {
+      "id": "latest_skips_unauthorized_native_8",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "request",
+            "native_config_version"
+          ],
+          "value": null
+        },
+        {
+          "path": [
+            "snapshots",
+            1
+          ],
+          "value": {
+            "schema_version": 1,
+            "request_id": "request-fixture",
+            "native_config_version": 8,
+            "status": "published",
+            "published_at": "2026-09-14T00:00:00Z",
+            "usable_until": "2026-09-14T00:05:00Z",
+            "providers": [
+              {
+                "provider_id": "provider-fixture",
+                "base_url": "https://upstream.example.invalid/v1",
+                "credential_ref": "secret-ref:fixture/provider-a",
+                "credential_namespace": "credential-namespace-fixture",
+                "protocol": "openai-responses",
+                "model_id": "fixture-text-model",
+                "capability_verification": "fixture_only",
+                "verified_capabilities": [
+                  "text",
+                  "stream",
+                  "tools",
+                  "reasoning"
+                ],
+                "model_policy": {
+                  "mode": "preserve_client",
+                  "fields": {}
+                },
+                "reasoning_policy": {
+                  "mode": "preserve_client",
+                  "fields": {}
+                },
+                "state_references": "reject"
+              }
+            ],
+            "bindings": [
+              {
+                "workload": "native.responses",
+                "provider_id": "provider-fixture",
+                "model_id": "fixture-text-model",
+                "timeout_ms": 30000,
+                "fallback": "disabled"
+              }
+            ],
+            "contract": "model-protocol/v1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "latest_chooses_authorized_native_8",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "auth",
+            "native_config_versions",
+            1
+          ],
+          "value": 8
+        },
+        {
+          "path": [
+            "request",
+            "native_config_version"
+          ],
+          "value": null
+        },
+        {
+          "path": [
+            "snapshots",
+            1
+          ],
+          "value": {
+            "schema_version": 1,
+            "request_id": "request-fixture",
+            "native_config_version": 8,
+            "status": "published",
+            "published_at": "2026-09-14T00:00:00Z",
+            "usable_until": "2026-09-14T00:05:00Z",
+            "providers": [
+              {
+                "provider_id": "provider-fixture",
+                "base_url": "https://upstream.example.invalid/v1",
+                "credential_ref": "secret-ref:fixture/provider-a",
+                "credential_namespace": "credential-namespace-fixture",
+                "protocol": "openai-responses",
+                "model_id": "fixture-text-model",
+                "capability_verification": "fixture_only",
+                "verified_capabilities": [
+                  "text",
+                  "stream",
+                  "tools",
+                  "reasoning"
+                ],
+                "model_policy": {
+                  "mode": "preserve_client",
+                  "fields": {}
+                },
+                "reasoning_policy": {
+                  "mode": "preserve_client",
+                  "fields": {}
+                },
+                "state_references": "reject"
+              }
+            ],
+            "bindings": [
+              {
+                "workload": "native.responses",
+                "provider_id": "provider-fixture",
+                "model_id": "fixture-text-model",
+                "timeout_ms": 30000,
+                "fallback": "disabled"
+              }
+            ],
+            "contract": "model-protocol/v1"
+          }
+        },
+        {
+          "path": [
+            "context",
+            "native_config_version"
+          ],
+          "value": 8
+        },
+        {
+          "path": [
+            "receipt",
+            "native_config_version"
+          ],
+          "value": 8
+        }
+      ]
+    },
+    {
+      "id": "latest_skips_revoked_native_8",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "auth",
+            "native_config_versions",
+            1
+          ],
+          "value": 8
+        },
+        {
+          "path": [
+            "request",
+            "native_config_version"
+          ],
+          "value": null
+        },
+        {
+          "path": [
+            "snapshots",
+            1
+          ],
+          "value": {
+            "schema_version": 1,
+            "request_id": "request-fixture",
+            "native_config_version": 8,
+            "status": "published",
+            "published_at": "2026-09-14T00:00:00Z",
+            "usable_until": "2026-09-14T00:05:00Z",
+            "providers": [
+              {
+                "provider_id": "provider-fixture",
+                "base_url": "https://upstream.example.invalid/v1",
+                "credential_ref": "secret-ref:fixture/provider-a",
+                "credential_namespace": "credential-namespace-fixture",
+                "protocol": "openai-responses",
+                "model_id": "fixture-text-model",
+                "capability_verification": "fixture_only",
+                "verified_capabilities": [
+                  "text",
+                  "stream",
+                  "tools",
+                  "reasoning"
+                ],
+                "model_policy": {
+                  "mode": "preserve_client",
+                  "fields": {}
+                },
+                "reasoning_policy": {
+                  "mode": "preserve_client",
+                  "fields": {}
+                },
+                "state_references": "reject"
+              }
+            ],
+            "bindings": [
+              {
+                "workload": "native.responses",
+                "provider_id": "provider-fixture",
+                "model_id": "fixture-text-model",
+                "timeout_ms": 30000,
+                "fallback": "disabled"
+              }
+            ],
+            "contract": "model-protocol/v1"
+          }
+        },
+        {
+          "path": [
+            "revoked_native_versions",
+            0
+          ],
+          "value": 8
+        }
+      ]
+    },
+    {
+      "id": "known_zero_usage",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "native_response",
+            "usage"
+          ],
+          "value": {
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        },
+        {
+          "path": [
+            "receipt",
+            "usage"
+          ],
+          "value": {
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        },
+        {
+          "path": [
+            "receipt",
+            "usage_complete"
+          ],
+          "value": true
+        },
+        {
+          "path": [
+            "receipt",
+            "native_usage"
+          ],
+          "value": {
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "partial_usage",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "native_response",
+            "usage"
+          ],
+          "value": {
+            "input_tokens": 0,
+            "vendor": false
+          }
+        },
+        {
+          "path": [
+            "receipt",
+            "usage"
+          ],
+          "value": {
+            "input_tokens": 0
+          }
+        },
+        {
+          "path": [
+            "receipt",
+            "native_usage"
+          ],
+          "value": {
+            "input_tokens": 0,
+            "vendor": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "unknown_reasoning_effort_preserved",
+      "expected_error": null,
+      "changes": [
+        {
+          "path": [
+            "native_request",
+            "reasoning",
+            "x_fixture"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "native_request",
+            "reasoning",
+            "effort"
+          ],
+          "value": "fixture-future-value"
+        },
+        {
+          "path": [
+            "receipt",
+            "requested_reasoning",
+            "reasoning",
+            "x_fixture"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "receipt",
+            "requested_reasoning",
+            "reasoning",
+            "effort"
+          ],
+          "value": "fixture-future-value"
+        },
+        {
+          "path": [
+            "receipt",
+            "effective_reasoning",
+            "reasoning",
+            "x_fixture"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "receipt",
+            "effective_reasoning",
+            "reasoning",
+            "effort"
+          ],
+          "value": "fixture-future-value"
+        },
+        {
+          "path": [
+            "upstream_request",
+            "reasoning",
+            "x_fixture"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "upstream_request",
+            "reasoning",
+            "effort"
+          ],
+          "value": "fixture-future-value"
+        }
+      ]
+    },
+    {
+      "id": "no_store_injection",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "upstream_request",
+            "store"
+          ],
+          "value": false
+        }
+      ]
+    },
+    {
+      "id": "no_model_rewrite",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "upstream_request",
+            "model"
+          ],
+          "value": "different"
+        }
+      ]
+    },
+    {
+      "id": "no_reasoning_downgrade",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "upstream_request",
+            "reasoning",
+            "x_fixture"
+          ],
+          "remove": true
+        },
+        {
+          "path": [
+            "upstream_request",
+            "reasoning",
+            "effort"
+          ],
+          "value": "low"
+        }
+      ]
+    },
+    {
+      "id": "native_false_cannot_be_zero",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "upstream_request",
+            "reasoning",
+            "x_fixture"
+          ],
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "receipt_false_cannot_be_zero",
+      "expected_error": "version_conflict",
+      "changes": [
+        {
+          "path": [
+            "receipt",
+            "effective_reasoning",
+            "reasoning",
+            "x_fixture"
+          ],
+          "value": 0
+        }
+      ]
+    }
+  ]
+}

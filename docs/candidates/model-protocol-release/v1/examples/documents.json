@@ -1,0 +1,372 @@
+[
+  {
+    "id": "config_request",
+    "schema": "config_request",
+    "document": {
+      "query": {
+        "schema_version": 1,
+        "request_id": "request-fixture",
+        "origin": {
+          "assertion_ref": "origin-fixture"
+        }
+      },
+      "native_config_version": 7,
+      "contract": "model-protocol/v1"
+    }
+  },
+  {
+    "id": "config_response",
+    "schema": "config_response",
+    "document": {
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "native_config_version": 7,
+      "status": "published",
+      "published_at": "2026-09-14T00:00:00Z",
+      "usable_until": "2026-09-14T00:05:00Z",
+      "providers": [
+        {
+          "provider_id": "provider-fixture",
+          "base_url": "https://upstream.example.invalid/v1",
+          "credential_ref": "secret-ref:fixture/provider-a",
+          "credential_namespace": "credential-namespace-fixture",
+          "protocol": "openai-responses",
+          "model_id": "fixture-text-model",
+          "capability_verification": "fixture_only",
+          "verified_capabilities": [
+            "text",
+            "stream",
+            "tools",
+            "reasoning"
+          ],
+          "model_policy": {
+            "mode": "preserve_client",
+            "fields": {}
+          },
+          "reasoning_policy": {
+            "mode": "preserve_client",
+            "fields": {}
+          },
+          "state_references": "reject"
+        }
+      ],
+      "bindings": [
+        {
+          "workload": "native.responses",
+          "provider_id": "provider-fixture",
+          "model_id": "fixture-text-model",
+          "timeout_ms": 30000,
+          "fallback": "disabled"
+        }
+      ],
+      "contract": "model-protocol/v1"
+    }
+  },
+  {
+    "id": "route_context",
+    "schema": "route_context",
+    "document": {
+      "request_id": "request-fixture",
+      "turn_id": "turn-fixture-1",
+      "native_config_version": 7,
+      "workload": "native.responses",
+      "protocol": "openai-responses",
+      "contract": "model-protocol/v1",
+      "principal_id": "principal-fixture",
+      "caller_service": "caller-fixture",
+      "credential_namespace": "credential-namespace-fixture"
+    }
+  },
+  {
+    "id": "route_receipt",
+    "schema": "route_receipt",
+    "document": {
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "native_config_version": 7,
+      "provider_id": "provider-fixture",
+      "credential_namespace": "credential-namespace-fixture",
+      "caller_service": "caller-fixture",
+      "requested_model": "fixture-text-model",
+      "resolved_model": "fixture-text-model",
+      "requested_reasoning": {
+        "reasoning": {
+          "effort": "medium",
+          "x_fixture": false
+        }
+      },
+      "effective_reasoning": {
+        "reasoning": {
+          "effort": "medium",
+          "x_fixture": false
+        }
+      },
+      "applied_policies": [],
+      "protocol": "openai-responses",
+      "outcome": "succeeded",
+      "upstream_request_id": "upstream-fixture",
+      "usage": null,
+      "usage_complete": false,
+      "fallback_used": false,
+      "observed_at": "2026-09-14T00:00:10Z",
+      "native_usage": null,
+      "contract": "model-protocol/v1",
+      "principal_id": "principal-fixture",
+      "response_id": "resp-fixture"
+    }
+  },
+  {
+    "id": "native_request",
+    "schema": "native_request",
+    "document": {
+      "model": "fixture-text-model",
+      "input": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Read only fixture"
+            }
+          ]
+        }
+      ],
+      "instructions": "Fixture instructions",
+      "tools": [
+        {
+          "type": "function",
+          "name": "fixture_read",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "reasoning": {
+        "effort": "medium",
+        "x_fixture": false
+      },
+      "stream": true,
+      "x_fixture_extension": {
+        "keep": 0
+      }
+    }
+  },
+  {
+    "id": "native_response",
+    "schema": "native_response",
+    "document": {
+      "object": "response",
+      "id": "resp-fixture",
+      "status": "completed",
+      "output": [],
+      "usage": null
+    }
+  },
+  {
+    "id": "trusted_access",
+    "schema": "trusted_access",
+    "document": {
+      "caller_service": "caller-fixture",
+      "principal_id": "principal-fixture",
+      "credential_namespace": "credential-namespace-fixture",
+      "assertion_ref": "origin-fixture",
+      "native_config_versions": [
+        7
+      ],
+      "config_versions": [
+        999
+      ],
+      "provider_ids": [
+        "provider-fixture"
+      ],
+      "permissions": [
+        "config.snapshot"
+      ],
+      "expires_at": "2026-09-14T00:10:00Z",
+      "revoked": false
+    }
+  },
+  {
+    "id": "error_invalid_input",
+    "schema": "error",
+    "http_status": 400,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "invalid_input",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_payload_too_large",
+    "schema": "error",
+    "http_status": 413,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "payload_too_large",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_unauthorized",
+    "schema": "error",
+    "http_status": 401,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "unauthorized",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_forbidden",
+    "schema": "error",
+    "http_status": 403,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "forbidden",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_not_found",
+    "schema": "error",
+    "http_status": 404,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "not_found",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_version_conflict",
+    "schema": "error",
+    "http_status": 409,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "version_conflict",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_idempotency_conflict",
+    "schema": "error",
+    "http_status": 409,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "idempotency_conflict",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_state_reference_unsupported",
+    "schema": "error",
+    "http_status": 409,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "state_reference_unsupported",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_unsupported_operation",
+    "schema": "error",
+    "http_status": 501,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "unsupported_operation",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_unsupported_version",
+    "schema": "error",
+    "http_status": 400,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "unsupported_version",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_queue_full",
+    "schema": "error",
+    "http_status": 429,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "queue_full",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_dependency_unavailable",
+    "schema": "error",
+    "http_status": 503,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "dependency_unavailable",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_timeout",
+    "schema": "error",
+    "http_status": 408,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "timeout",
+      "execution_state": "not_started",
+      "retryable": false
+    }
+  },
+  {
+    "id": "error_result_unknown",
+    "schema": "error",
+    "http_status": 502,
+    "document": {
+      "contract": "model-protocol/v1",
+      "schema_version": 1,
+      "request_id": "request-fixture",
+      "code": "result_unknown",
+      "execution_state": "unknown",
+      "retryable": false
+    }
+  }
+]

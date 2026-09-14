@@ -1,0 +1,21 @@
+{
+  "local_error_schema": "model#error",
+  "http_status_by_code": {
+    "invalid_input": 400,
+    "payload_too_large": 413,
+    "unauthorized": 401,
+    "forbidden": 403,
+    "not_found": 404,
+    "version_conflict": 409,
+    "idempotency_conflict": 409,
+    "state_reference_unsupported": 409,
+    "unsupported_operation": 501,
+    "unsupported_version": 400,
+    "queue_full": 429,
+    "dependency_unavailable": 503,
+    "timeout": 408,
+    "result_unknown": 502
+  },
+  "retryable": false,
+  "upstream_native_errors": "Preserve upstream HTTP status and safe JSON body, do not validate them as local model#error."
+}

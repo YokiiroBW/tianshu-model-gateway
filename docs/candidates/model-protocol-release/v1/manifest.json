@@ -1,0 +1,48 @@
+{
+  "package": "model-protocol/v1",
+  "version": "1.0.0",
+  "schema_version": 1,
+  "status": "release_ready_unpublished",
+  "source_candidate": "TS-042 release block; supersedes historical candidate only upon coordinator publication",
+  "interface_catalog": "interfaces.json",
+  "runtime_routes_enabled": false,
+  "producer_confirmation": "pending_platform_native_increment",
+  "consumer_confirmation": "internal_protocol_transport_only_pending_published_native_adapter",
+  "dependencies": [
+    {
+      "id": "https://contracts.tianshu.invalid/text-dialogue/v1/common.json",
+      "package": "text-dialogue/v1",
+      "version": "1.0.0",
+      "path": "schemas/common.json",
+      "sha256": "b296a79d7eb0218d9b444c4ddbba837ad576f46a7a4e50fbcebec7618d8ef9af"
+    }
+  ],
+  "wire_types": [
+    "model#config_request",
+    "model#config_response",
+    "model#native_request",
+    "model#upstream_request",
+    "model#native_response",
+    "model#route_receipt",
+    "model#error"
+  ],
+  "internal_projection_types": [
+    "model#route_context",
+    "model#trusted_access"
+  ],
+  "hash_basis": "UTF-8 text bytes with CRLF normalized to LF; manifest itself pinned externally",
+  "sha256": {
+    "compatibility.md": "32cfba5f8fbca8e6ef9aff7ab871931dd82b0d596eeb40030542d5bcc6ca4dc3",
+    "errors.json": "e7a155ee5b5b058eb8d9d1195f0ee6887aff9ed94099b39939c76cb880996fa3",
+    "examples/documents.json": "385414cc43fe07df1f19d561926ece8f6c44d3018cccd307d936fd33cd663428",
+    "examples/negative-documents.json": "99cdcf4305ed2b0c12b5778311b6eeee282be3d5027ffddcdb30c56219bd99a9",
+    "examples/relations.json": "1c3f18bb29b2023280419bb47e7a02151ba1dc1668f691d32a77d94d3aad5ff1",
+    "interfaces.json": "b808f8e6c3de29639d2937a50f49f93176e04ee36dad3ad6a6bc878a26138084",
+    "README.md": "89b4dd3a95aeff45824560468a727e25a64729bf8835e778f5a17e6471244f2b",
+    "requirements.txt": "9cba6d4508d006391ab899893990d5ac5d03b4811a0f71f152c5883897ee8120",
+    "schemas/model.json": "de715187a3e99a8dffd2afb55c35d610328031c1cceae5d471088a74c143dd0f",
+    "semantics.md": "df9f6e5286ef77b66a8c4aab76b9ff805dc7804dd0a91143f619e465b8620568",
+    "test_validator.py": "1cbefa0b3c096caff4708826a442c50eca3004f4fdd206b7782356a3177a3dea",
+    "validate.py": "11b40869ff390e5c62774f065cc897ea75be43cad45808720c2b904e1806f740"
+  }
+}
