@@ -8,14 +8,17 @@ identity columns, and the two spaces are never mixed in one selection.
 
 Only normalized ``input_tokens``/``output_tokens`` are aggregated. The vendor-native usage
 structure stays in the receipt, is never summed, and a value that was not reported stays
-``null`` with an explicit missing count instead of becoming zero.
+``null`` with an explicit missing count instead of becoming zero. An attempt whose private
+metric row was never written is reported under ``coverage.unmetered_total``, and a stored
+value beyond the projection bound widens a sum by the bound at most while being counted
+under ``clamped``, so a bounded aggregate cannot overflow a signed 64-bit integer.
 """
 
 import math
 from datetime import datetime, timedelta, timezone
 
 from .contracts import Rejected
-from .diagnostics import NATIVE_IDENTITY_FIELDS
+from .diagnostics import MAX_METRIC_TOKENS, NATIVE_IDENTITY_FIELDS, USAGE_SOURCES
 
 SCHEMA_VERSION = 1
 ALLOWED_PARAMETERS = ("view", "since", "until", "limit", "offset")
@@ -52,6 +55,33 @@ LATENCY_COLUMNS = (
 SUCCEEDED_REASONS = frozenset({"completed", "response_completed"})
 FAILED_REASONS = frozenset({"response_failed"})
 CANCELLED_REASONS = frozenset({"cancelled_unknown"})
+
+
+def source_usage(row):
+    """One usage aggregate row: sums of indexed values plus explicit degradation.
+
+    ``reported``/``missing`` say how many attempts carried an indexed value, and ``clamped``
+    counts values larger than the projection bound, which contribute the bound to ``sum``.
+    Nothing that was not reported is ever counted as zero.
+    """
+    attempts, fed, fed_sum, fed_clamped, oed, oed_sum, oed_clamped, complete, absent = row
+    return {
+        "attempts": attempts,
+        "complete": complete,
+        "input_tokens": {
+            "sum": fed_sum,
+            "reported": fed,
+            "missing": attempts - fed,
+            "clamped": fed_clamped,
+        },
+        "output_tokens": {
+            "sum": oed_sum,
+            "reported": oed,
+            "missing": attempts - oed,
+            "clamped": oed_clamped,
+        },
+        "no_usage_reported": absent,
+    }
 
 
 def parse_instant(value):
@@ -177,7 +207,13 @@ class Selection:
         )[0]
 
     def unmetered(self, connection):
-        """Attempts that predate this metric table or never reached a terminal record."""
+        """Attempts with a terminal receipt but no private metric row.
+
+        That covers attempts made before this metric table existed, attempts whose metric
+        row was never written because the best-effort projection failed, and any other
+        attempt without a private row. They are counted here on purpose and never enter the
+        aggregates, so a missing measurement can never be read as zero.
+        """
         return self.scalar(
             connection,
             f"SELECT (SELECT COUNT(*) FROM {self.receipts} r WHERE {self._filter('r')})"
@@ -260,63 +296,43 @@ class Selection:
         return counts, reasons
 
     def usage(self, connection):
+        # A stored value above the projection bound contributes the bound to a sum and is
+        # counted under "clamped". The projection refuses to index such a value, so this
+        # can only come from a ledger written before that bound existed; clamping keeps a
+        # bounded aggregate inside a signed 64-bit integer instead of raising an overflow
+        # error, and the count keeps the substitution visible instead of silent.
+        bound = MAX_METRIC_TOKENS
         select = (
-            "COUNT(*), COUNT(input_tokens), COALESCE(SUM(input_tokens),0), "
-            "COUNT(output_tokens), COALESCE(SUM(output_tokens),0), "
+            "COUNT(*), "
+            f"COUNT(input_tokens), COALESCE(SUM(MIN(input_tokens, {bound})),0), "
+            f"COALESCE(SUM(input_tokens > {bound}),0), "
+            f"COUNT(output_tokens), COALESCE(SUM(MIN(output_tokens, {bound})),0), "
+            f"COALESCE(SUM(output_tokens > {bound}),0), "
             "COALESCE(SUM(usage_complete),0), "
             "COALESCE(SUM(input_tokens IS NULL AND output_tokens IS NULL),0)"
         )
         sources = {}
-        for source, attempts, fed, fed_sum, oed, oed_sum, complete, absent in connection.execute(
+        for source, *row in connection.execute(
             f"SELECT usage_source, {select} FROM {self.window} GROUP BY usage_source "
             "ORDER BY usage_source",
             self.parameters,
         ):
-            sources[source] = {
-                "attempts": attempts,
-                "complete": complete,
-                "input_tokens": {"sum": fed_sum, "reported": fed, "missing": attempts - fed},
-                "output_tokens": {"sum": oed_sum, "reported": oed, "missing": attempts - oed},
-                "no_usage_reported": absent,
-            }
-        for source in (
-            "upstream_json_usage",
-            "upstream_stream_usage",
-            "not_reported",
-            "unobserved",
-        ):
-            sources.setdefault(
-                source,
-                {
-                    "attempts": 0,
-                    "complete": 0,
-                    "input_tokens": {"sum": 0, "reported": 0, "missing": 0},
-                    "output_tokens": {"sum": 0, "reported": 0, "missing": 0},
-                    "no_usage_reported": 0,
-                },
-            )
-        row = self.scalar(connection, f"SELECT {select} FROM {self.window}", self.parameters)
-        total, fed, fed_sum, oed, oed_sum, complete, absent = row
-        return {
-            "attempts": total,
-            "complete": complete,
-            "partial": total - complete - absent,
-            "missing": absent,
-            "normalized": {
-                "input_tokens": {
-                    "sum": fed_sum,
-                    "reported": fed,
-                    "missing": total - fed,
-                },
-                "output_tokens": {
-                    "sum": oed_sum,
-                    "reported": oed,
-                    "missing": total - oed,
-                },
-            },
-            "by_source": sources,
-            "vendor_fields_aggregated": False,
+            sources[source] = source_usage(row)
+        for absent_source in USAGE_SOURCES:
+            sources.setdefault(absent_source, source_usage([0] * 9))
+        total = source_usage(
+            self.scalar(connection, f"SELECT {select} FROM {self.window}", self.parameters)
+        )
+        total["partial"] = total["attempts"] - total["complete"] - total["no_usage_reported"]
+        total["missing"] = total["no_usage_reported"]
+        total.pop("no_usage_reported")
+        total["normalized"] = {
+            "input_tokens": dict(total["input_tokens"]),
+            "output_tokens": dict(total["output_tokens"]),
         }
+        total["by_source"] = sources
+        total["vendor_fields_aggregated"] = False
+        return total
 
     def attempts(self, connection):
         rows = connection.execute(
@@ -381,6 +397,12 @@ def build_report(connection, key_space, identity, values):
             "it is not model generation time.",
             "Only normalized input_tokens/output_tokens are aggregated; the vendor-native "
             "usage structure stays in the receipt.",
+            "coverage.unmetered_total counts attempts with a terminal receipt but no private "
+            "metric row, including attempts whose metric row could not be written: those "
+            "attempts are absent from the aggregates and are never reported as zero usage "
+            "or zero latency.",
+            "A stored token value above the projection bound contributes the bound to a sum "
+            "and is counted under clamped; nothing is truncated silently.",
         ],
     }
     if view == "attempts":

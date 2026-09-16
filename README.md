@@ -74,4 +74,5 @@ git diff --check
 - 计数分为成功/失败/取消/未知并恒等于总数；用量只聚合归一化 input/output tokens，来源显式（`upstream_json_usage`/`upstream_stream_usage`/`not_reported`/`unobserved`），缺失按缺失计数而不是 0，供应商原始结构不求和。
 - 延迟区分请求总耗时与首上游字节/首事件/首输出；未观察记 null。总耗时含背压，不代表模型生成耗时。
 - 新私有表 `request_metrics`/`native_request_metrics` 首次在既有部署上启动时先整库备份 `<ledger>.ts043-backup` 再建表，既有表与旧回执不变，缺新表的历史行计入 `coverage.unmetered_total`。不新增全量内容日志、后台遥测、全表内存扫描或费用估算，也不修改根 contracts 与依赖锁。
+- 诊断是尽力而为的旁路：回执先写、私有度量后写且各自独立事务。度量写入失败只留一条无值告警，不回滚权威回执、不改变 `reason`、不截断已交付的 JSON/SSE 字节、不重试；该次尝试只出现在 `coverage.unmetered_total`，不会被当作 0 用量或 0 延迟。超出 SQLite 整数范围的供应商 token 数（如 `2**63`）仍原样保留在回执与响应中，私有投影不索引该值并把该行记为不完整。
 - 命令、参数与验证界限见[运行说明](docs/gateway-runtime.md)，取舍见[TS-043 决定](docs/decisions/TS-043-usage-report.md)，交付见[TS-043 交接](docs/handoffs/TS-043.md)。

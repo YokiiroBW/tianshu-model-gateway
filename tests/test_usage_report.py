@@ -30,6 +30,7 @@ from gateway_fixtures import (
     NATIVE_CONTRACT,
     NATIVE_DOCUMENTS,
     SECRETS,
+    STREAM,
     RecordingServices,
     event,
     native_event,
@@ -39,11 +40,13 @@ from gateway_fixtures import (
 from tianshu_gateway.config import ClientGrant, utcnow
 from tianshu_gateway.contracts import Rejected
 from tianshu_gateway.diagnostics import (
+    MAX_METRIC_TOKENS,
     NATIVE_IDENTITY_FIELDS,
     UNOBSERVED,
     AttemptMetrics,
     Diagnostics,
     attempt_metrics,
+    metric_tokens,
 )
 from tianshu_gateway.native import NativeGrant
 from tianshu_gateway.responses import ResponsesObserver
@@ -157,15 +160,16 @@ def write_attempt(ledger, service, request_id, reason, status, elapsed, metrics,
         )
 
 
-class MetricFaultConnection:
-    """A connection that fails exactly the private metric statement."""
+class FaultConnection:
+    """A connection that fails exactly one class of statement and delegates the rest."""
 
-    def __init__(self, connection):
+    def __init__(self, connection, marker):
         self.wrapped = connection
+        self.marker = marker
 
     def execute(self, sql, parameters=()):
-        if "request_metrics" in sql:
-            raise sqlite3.OperationalError("fixture metric failure")
+        if self.marker in sql:
+            raise sqlite3.OperationalError("fixture statement failure")
         return self.wrapped.execute(sql, parameters)
 
     def __enter__(self):
@@ -285,31 +289,202 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertEqual(report["counts"]["total"], 1)
         self.assertEqual(
             report["usage"]["normalized"]["input_tokens"],
-            {"sum": 3, "reported": 1, "missing": 0},
+            {"sum": 3, "reported": 1, "missing": 0, "clamped": 0},
         )
 
-    def test_a_failing_metric_write_rolls_back_the_receipt_too(self):
+    def test_a_failing_metric_write_keeps_the_authoritative_receipt(self):
+        """The private projection is best effort: it may not change the terminal receipt.
+
+        This is the boundary the coordinator reproduced at HTTP level. A private metric
+        write that fails must leave the authoritative receipt and its reason untouched, and
+        the attempt is then reported as unmetered instead of as a successful zero.
+        """
         ledger = Diagnostics(self.path)
         self.addCleanup(ledger.close)
-        document = receipt_document("companion", "atomic", {"input_tokens": 1}, True)
+        document = receipt_document(
+            "companion", "degraded", {"input_tokens": 1}, True, outcome="succeeded"
+        )
         with ledger.connection:
             ledger.connection.execute(
                 "INSERT INTO requests VALUES (?,?,?,?,?,?)",
-                ("companion", "atomic", json.dumps(document), "in_flight", None, None),
+                ("companion", "degraded", json.dumps(document), "in_flight", None, None),
             )
         real = ledger.connection
-        ledger.connection = MetricFaultConnection(real)
-        with self.assertRaises(sqlite3.OperationalError):
+        ledger.connection = FaultConnection(real, "request_metrics")
+        with self.assertLogs("tianshu_gateway", level="WARNING") as logs:
             ledger.finish(document, "completed", 5, 200, UNOBSERVED)
         ledger.connection = real
         reason, stored = ledger.connection.execute(
-            "SELECT reason, receipt FROM requests WHERE service='companion' AND request_id='atomic'"
+            "SELECT reason, receipt FROM requests WHERE service='companion' AND request_id='degraded'"
         ).fetchone()
-        self.assertEqual(reason, "in_flight")
-        self.assertEqual(json.loads(stored)["outcome"], "unknown")
+        self.assertEqual(reason, "completed")
+        self.assertEqual(json.loads(stored)["outcome"], "succeeded")
         self.assertEqual(
             ledger.connection.execute("SELECT COUNT(*) FROM request_metrics").fetchone()[0], 0
         )
+        self.assertIn("metric_write_degraded", " ".join(logs.output))
+        report = build_report(
+            ledger.connection, "chat", {"service": "companion"}, window(view="attempts")
+        )
+        # No private row means no measurement: the attempt is unmetered, never zero.
+        self.assertEqual(report["coverage"]["unmetered_total"], 1)
+        self.assertEqual(report["counts"]["total"], 0)
+        self.assertEqual(report["usage"]["attempts"], 0)
+        self.assertEqual(
+            report["usage"]["normalized"]["input_tokens"],
+            {"sum": 0, "reported": 0, "missing": 0, "clamped": 0},
+        )
+        self.assertIsNone(report["latency_ms"]["request_total_ms"]["p50"])
+        self.assertEqual(report["latency_ms"]["request_total_ms"]["observed"], 0)
+        self.assertEqual(report["attempts"], [])
+
+    def test_a_failing_native_metric_write_keeps_the_native_receipt(self):
+        ledger = Diagnostics(self.path)
+        self.addCleanup(ledger.close)
+        document = {
+            "contract": "model-protocol/v1",
+            "principal_id": "principal-fixture",
+            "caller_service": "caller-fixture",
+            "credential_namespace": NAMESPACE,
+            "request_id": "native-degraded",
+            "native_config_version": 7,
+        }
+        ledger.native_begin(document, "native-turn-degraded")
+        receipt = {
+            **document,
+            "outcome": "succeeded",
+            "usage": {"input_tokens": 2, "output_tokens": 3},
+            "native_usage": {"input_tokens": 2, "output_tokens": 3},
+            "usage_complete": True,
+            "observed_at": "2026-01-01T00:00:00Z",
+        }
+        real = ledger.connection
+        ledger.connection = FaultConnection(real, "native_request_metrics")
+        with self.assertLogs("tianshu_gateway", level="WARNING"):
+            ledger.native_finish(receipt, "response_completed", 7, 200, UNOBSERVED)
+        ledger.connection = real
+        row = ledger.connection.execute(
+            "SELECT reason FROM native_requests WHERE request_id='native-degraded'"
+        ).fetchone()
+        self.assertEqual(row[0], "response_completed")
+        self.assertEqual(
+            ledger.connection.execute("SELECT COUNT(*) FROM native_request_metrics").fetchone()[0],
+            0,
+        )
+        identity = {name: document[name] for name in NATIVE_IDENTITY_FIELDS}
+        report = build_report(ledger.connection, "native", identity, window(view="summary"))
+        self.assertEqual(report["coverage"]["unmetered_total"], 1)
+        self.assertEqual(report["counts"]["total"], 0)
+
+    def test_a_failing_receipt_write_still_propagates(self):
+        """Only the projection degrades: the authoritative terminal write is not swallowed."""
+        ledger = Diagnostics(self.path)
+        self.addCleanup(ledger.close)
+        document = receipt_document(
+            "companion", "authoritative", {"input_tokens": 1}, True, outcome="succeeded"
+        )
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO requests VALUES (?,?,?,?,?,?)",
+                ("companion", "authoritative", json.dumps(document), "in_flight", None, None),
+            )
+        real = ledger.connection
+        ledger.connection = FaultConnection(real, "UPDATE requests")
+        with self.assertRaises(sqlite3.OperationalError):
+            ledger.finish(document, "completed", 5, 200, UNOBSERVED)
+        ledger.connection = real
+        row = ledger.connection.execute(
+            "SELECT reason FROM requests WHERE request_id='authoritative'"
+        ).fetchone()
+        self.assertEqual(row[0], "in_flight")
+        self.assertEqual(
+            ledger.connection.execute("SELECT COUNT(*) FROM request_metrics").fetchone()[0], 0
+        )
+
+    def test_an_unindexable_upstream_usage_degrades_instead_of_overflowing(self):
+        """A count beyond the projection bound is not indexed, truncated or invented.
+
+        The authoritative receipt keeps exactly what the provider reported; the private row
+        leaves that half absent and marks itself incomplete, and the report counts it as
+        missing rather than as a value.
+        """
+        for value in (2**63, MAX_METRIC_TOKENS + 1, -1, "12", 1.5, True):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    AttemptMetrics(input_tokens=value)
+        self.assertEqual(
+            AttemptMetrics(input_tokens=MAX_METRIC_TOKENS).input_tokens, MAX_METRIC_TOKENS
+        )
+        self.assertIsNone(metric_tokens(2**63))
+        self.assertEqual(metric_tokens(0), 0)
+
+        receipt = receipt_document("companion", "huge", None, True, outcome="succeeded")
+        receipt["usage"] = {"input_tokens": 2**63, "output_tokens": 4}
+        receipt["native_usage"] = {"prompt_tokens": 2**63, "completion_tokens": 4}
+        metrics = attempt_metrics(receipt, None, 9, False, True)
+        self.assertIsNone(metrics.input_tokens)
+        self.assertEqual(metrics.output_tokens, 4)
+        self.assertFalse(metrics.usage_complete)
+        self.assertEqual(metrics.usage_source, "upstream_json_usage")
+
+        ledger = Diagnostics(self.path)
+        self.addCleanup(ledger.close)
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO requests VALUES (?,?,?,?,?,?)",
+                ("companion", "huge", json.dumps(receipt), "in_flight", None, None),
+            )
+        ledger.finish(receipt, "completed", 9, 200, metrics)
+        stored = ledger.get("companion", "huge")
+        self.assertEqual(stored["usage"]["input_tokens"], 2**63)
+        self.assertTrue(stored["usage_complete"])
+        row = ledger.connection.execute(
+            "SELECT input_tokens, output_tokens, usage_complete FROM request_metrics"
+        ).fetchone()
+        self.assertEqual(row, (None, 4, 0))
+        report = build_report(ledger.connection, "chat", {"service": "companion"}, window())
+        self.assertEqual(
+            report["usage"]["normalized"]["input_tokens"],
+            {"sum": 0, "reported": 0, "missing": 1, "clamped": 0},
+        )
+        self.assertEqual(
+            report["usage"]["normalized"]["output_tokens"],
+            {"sum": 4, "reported": 1, "missing": 0, "clamped": 0},
+        )
+        self.assertEqual(
+            report["usage"]["by_source"]["upstream_json_usage"]["input_tokens"]["missing"], 1
+        )
+        self.assertEqual(report["counts"]["succeeded"], 1)
+
+    def test_a_bounded_aggregate_cannot_overflow_a_signed_integer(self):
+        """Rows written before the bound existed stay readable instead of breaking the sum."""
+        ledger = Diagnostics(self.path)
+        self.addCleanup(ledger.close)
+        stamp = int(utcnow().timestamp() * 1000)
+        for index in range(3):
+            write_attempt(
+                ledger,
+                "companion",
+                f"legacy-{index}",
+                "completed",
+                200,
+                5,
+                AttemptMetrics(usage_source="upstream_json_usage"),
+                stamp,
+            )
+        with ledger.connection:
+            ledger.connection.execute(
+                "UPDATE request_metrics SET input_tokens=?, usage_complete=1", (2**63 - 1,)
+            )
+        # An unclamped sum over such rows would not fit a signed 64-bit integer.
+        with self.assertRaises(sqlite3.OperationalError):
+            ledger.connection.execute("SELECT SUM(input_tokens) FROM request_metrics").fetchone()
+        normalized = build_report(ledger.connection, "chat", {"service": "companion"}, window())[
+            "usage"
+        ]["normalized"]["input_tokens"]
+        self.assertEqual(normalized["reported"], 3)
+        self.assertEqual(normalized["clamped"], 3)
+        self.assertEqual(normalized["sum"], 3 * MAX_METRIC_TOKENS)
 
     def test_an_attempt_without_a_metric_row_is_reported_as_unmetered(self):
         ledger = Diagnostics(self.path)
@@ -802,7 +977,8 @@ class UsageHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["usage"]["partial"], 0)
         for key in ("input_tokens", "output_tokens"):
             self.assertEqual(
-                report["usage"]["normalized"][key], {"sum": 0, "reported": 0, "missing": 1}
+                report["usage"]["normalized"][key],
+                {"sum": 0, "reported": 0, "missing": 1, "clamped": 0},
             )
         self.assertEqual(report["usage"]["by_source"]["not_reported"]["attempts"], 1)
         row = self.metric_row("no-usage")
@@ -1111,6 +1287,243 @@ class UsageHttpTests(unittest.IsolatedAsyncioTestCase):
             ):
                 self.assertNotIn(forbidden, document)
             self.assertNotIn(self.ledger_path, document)
+
+    async def test_the_upstream_response_bytes_are_extractable_for_fidelity_checks(self):
+        """The byte strings these isolation assertions compare against are the real ones."""
+        async with await self.chat(headers=self.chat_headers(request_id="bytes-json")) as response:
+            self.assertEqual(await response.read(), json.dumps(self.services.response).encode())
+        self.services.mode = "stream"
+        async with await self.chat(
+            headers=self.chat_headers(request_id="bytes-stream"), stream=True
+        ) as response:
+            self.assertEqual(await response.read(), self.services.stream)
+
+    # The coordinator reproduced four failure modes at HTTP level against commit 2af57be:
+    # a failing private metric write turned a successful Chat JSON and a successful native
+    # JSON into an error, truncated an already-200 SSE answer, and an upstream
+    # usage.prompt_tokens of 2**63 overflowed the metric binding. The private projection is
+    # now best effort, so these tests assert the opposite: the authoritative answer, its
+    # bytes and its receipt survive, and the attempt is reported as unmetered.
+
+    def fail_metric_writes(self, table="request_metrics"):
+        """Fail exactly the private metric INSERT, as the coordinator's probe did.
+
+        A TEMP trigger is per connection, is not part of the schema, and raises ABORT for
+        that one statement, so every other write, read and response stays real.
+        """
+        self.gateway.diagnostics.connection.execute(
+            f"CREATE TEMP TRIGGER fail_metric BEFORE INSERT ON {table} "
+            "BEGIN SELECT RAISE(ABORT, 'isolated metric failure'); END"
+        )
+
+    def metric_rows(self, table="request_metrics"):
+        return self.gateway.diagnostics.connection.execute(
+            f"SELECT COUNT(*) FROM {table}"
+        ).fetchone()[0]
+
+    async def test_a_metric_write_failure_never_changes_a_chat_json_answer(self):
+        self.fail_metric_writes()
+        with self.assertLogs("tianshu_gateway", level="WARNING") as logs:
+            async with await self.chat(
+                headers=self.chat_headers(request_id="json-metric-fault")
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.read(), json.dumps(self.services.response).encode())
+        await self.idle()
+        # Exactly one upstream call: a diagnostic failure is never retried.
+        self.assertEqual(len(self.services.calls), 1)
+        receipt = await self.stored_receipt("json-metric-fault")
+        self.assertEqual(receipt["outcome"], "succeeded")
+        self.assertEqual(receipt["usage"], {"input_tokens": 0})
+        self.assertIn("metric_write_degraded", " ".join(logs.output))
+        self.assertEqual(self.metric_rows(), 0)
+        report = await self.report(view="attempts")
+        # The attempt is explicit and unmetered; nothing is reported as a zero measurement.
+        self.assertEqual(report["coverage"]["unmetered_total"], 1)
+        self.assertEqual(report["counts"]["total"], 0)
+        self.assertEqual(report["usage"]["attempts"], 0)
+        self.assertEqual(report["attempts"], [])
+        self.assertEqual(report["latency_ms"]["request_total_ms"]["observed"], 0)
+        self.assertIsNone(report["latency_ms"]["request_total_ms"]["max"])
+        self.assertEqual(
+            report["usage"]["normalized"]["input_tokens"],
+            {"sum": 0, "reported": 0, "missing": 0, "clamped": 0},
+        )
+
+    async def test_a_metric_write_failure_never_changes_a_native_json_answer(self):
+        self.fail_metric_writes("native_request_metrics")
+        async with await self.native(stream=False) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.read(), self.services.native_response_bytes)
+        await self.idle()
+        self.assertEqual(len(self.services.native_calls), 1)
+        row = self.gateway.diagnostics.connection.execute(
+            "SELECT reason, receipt FROM native_requests"
+        ).fetchone()
+        # The native terminal receipt is written even though its metric row is not: the
+        # attempt is never left in_flight by a diagnostic failure.
+        self.assertEqual(row[0], "response_completed")
+        self.assertEqual(json.loads(row[1])["outcome"], "succeeded")
+        self.assertEqual(self.metric_rows("native_request_metrics"), 0)
+        report = await self.report(path=NATIVE_USAGE_PATH, token="TS042_TEST_NATIVE")
+        self.assertEqual(report["key_space"], "native")
+        self.assertEqual(report["identity"]["contract"], "model-protocol/v1")
+        self.assertEqual(report["coverage"]["unmetered_total"], 1)
+        self.assertEqual(report["counts"]["total"], 0)
+
+    async def test_a_metric_write_failure_never_truncates_a_chat_sse_answer(self):
+        self.fail_metric_writes()
+        self.services.mode = "stream"
+        with self.assertLogs("tianshu_gateway", level="WARNING"):
+            async with await self.chat(
+                headers=self.chat_headers(request_id="sse-metric-fault"), stream=True
+            ) as response:
+                self.assertEqual(response.status, 200)
+                # The client reads the whole recorded stream: no ClientPayloadError and no
+                # aborted transport because a diagnostic write failed after the fact.
+                self.assertEqual(await response.read(), self.services.stream)
+        await self.idle()
+        receipt = await self.stored_receipt("sse-metric-fault")
+        self.assertEqual(receipt["outcome"], "succeeded")
+        self.assertEqual(receipt["usage"], {"input_tokens": 0, "output_tokens": 9})
+        self.assertTrue(receipt["usage_complete"])
+        self.assertEqual(self.metric_rows(), 0)
+        report = await self.report()
+        self.assertEqual(report["coverage"]["unmetered_total"], 1)
+        self.assertEqual(report["counts"]["succeeded"], 0)
+        self.assertEqual(report["counts"]["total"], 0)
+
+    async def test_a_metric_write_failure_never_truncates_a_native_sse_answer(self):
+        self.fail_metric_writes("native_request_metrics")
+        self.services.native_mode = "stream"
+        with self.assertLogs("tianshu_gateway", level="WARNING"):
+            async with await self.native(stream=True) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.read(), self.services.native_stream)
+        await self.idle()
+        row = self.gateway.diagnostics.connection.execute(
+            "SELECT reason FROM native_requests"
+        ).fetchone()
+        self.assertEqual(row[0], "response_completed")
+
+    async def test_an_out_of_range_upstream_usage_never_changes_the_answer(self):
+        high = 2**63
+        self.services.response["usage"] = {"prompt_tokens": high, "completion_tokens": 4}
+        async with await self.chat(headers=self.chat_headers(request_id="huge-json")) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.read(), json.dumps(self.services.response).encode())
+        self.services.mode = "stream"
+        self.services.stream = STREAM.replace(
+            b'"prompt_tokens":0', f'"prompt_tokens":{high}'.encode()
+        )
+        self.assertNotEqual(self.services.stream, STREAM)
+        async with await self.chat(
+            headers=self.chat_headers(request_id="huge-stream"), stream=True
+        ) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.read(), self.services.stream)
+        await self.idle()
+        self.assertEqual(len(self.services.calls), 2)
+        # The authoritative receipts keep exactly the value the provider reported.
+        json_receipt = await self.stored_receipt("huge-json")
+        self.assertEqual(json_receipt["outcome"], "succeeded")
+        self.assertEqual(json_receipt["usage"], {"input_tokens": high, "output_tokens": 4})
+        self.assertTrue(json_receipt["usage_complete"])
+        stream_receipt = await self.stored_receipt("huge-stream")
+        self.assertEqual(stream_receipt["outcome"], "succeeded")
+        self.assertEqual(stream_receipt["usage"], {"input_tokens": high, "output_tokens": 9})
+        # The private projection indexes no value it cannot store and marks the row
+        # incomplete: the reported value is neither truncated nor replaced by zero.
+        rows = self.gateway.diagnostics.connection.execute(
+            "SELECT input_tokens, output_tokens, usage_complete FROM request_metrics "
+            "ORDER BY request_id"
+        ).fetchall()
+        self.assertEqual(rows, [(None, 4, 0), (None, 9, 0)])
+        report = await self.report(view="attempts")
+        self.assertEqual(report["counts"]["succeeded"], 2)
+        self.assertEqual(report["coverage"]["unmetered_total"], 0)
+        self.assertEqual(
+            report["usage"]["normalized"]["input_tokens"],
+            {"sum": 0, "reported": 0, "missing": 2, "clamped": 0},
+        )
+        self.assertEqual(
+            report["usage"]["normalized"]["output_tokens"],
+            {"sum": 13, "reported": 2, "missing": 0, "clamped": 0},
+        )
+        self.assertEqual(
+            report["usage"]["by_source"]["upstream_json_usage"]["input_tokens"],
+            {"sum": 0, "reported": 0, "missing": 1, "clamped": 0},
+        )
+        self.assertFalse(any(row["usage_complete"] for row in report["attempts"]))
+        self.assertEqual(report["usage"]["complete"], 0)
+        # The per-attempt row is explicit about the half that could not be indexed.
+        rows_by_id = {row["request_id"]: row for row in report["attempts"]}
+        self.assertIsNone(rows_by_id["huge-json"]["input_tokens"])
+        self.assertEqual(rows_by_id["huge-json"]["output_tokens"], 4)
+        self.assertFalse(rows_by_id["huge-json"]["usage_complete"])
+        self.assertIsNone(rows_by_id["huge-stream"]["input_tokens"])
+        self.assertEqual(rows_by_id["huge-stream"]["output_tokens"], 9)
+
+    async def test_a_metric_write_failure_never_hides_a_real_upstream_error(self):
+        self.fail_metric_writes()
+        self.services.mode = "error"
+        self.services.http_status = 429
+        with self.assertLogs("tianshu_gateway", level="WARNING"):
+            async with await self.chat(
+                headers=self.chat_headers(request_id="real-error")
+            ) as response:
+                self.assertEqual(response.status, 429)
+            self.services.mode = "hold"
+            self.services.config["bindings"][0]["timeout_ms"] = 20
+            async with await self.chat(
+                headers=self.chat_headers(request_id="real-timeout")
+            ) as response:
+                self.assertEqual(response.status, 502)
+            self.services.config["bindings"][0]["timeout_ms"] = 1500
+            self.services.mode = "json"
+            async with await self.chat(headers=self.chat_headers(request_id="real-ok")) as response:
+                self.assertEqual(response.status, 200)
+        await self.idle()
+        # A genuine upstream failure still reaches the caller and its receipt unchanged.
+        self.assertEqual((await self.stored_receipt("real-error"))["outcome"], "failed")
+        self.assertEqual((await self.stored_receipt("real-timeout"))["outcome"], "unknown")
+        self.assertEqual((await self.stored_receipt("real-ok"))["outcome"], "succeeded")
+        self.assertEqual(self.metric_rows(), 0)
+        report = await self.report()
+        self.assertEqual(report["coverage"]["unmetered_total"], 3)
+        self.assertEqual(report["counts"]["total"], 0)
+
+    async def test_an_unmetered_attempt_keeps_its_receipt_across_a_restart(self):
+        self.fail_metric_writes()
+        with self.assertLogs("tianshu_gateway", level="WARNING"):
+            async with await self.chat(
+                headers=self.chat_headers(request_id="unmetered-restart")
+            ) as response:
+                self.assertEqual(response.status, 200)
+        await self.idle()
+        restarted = create_app(self.settings)
+        runner, url = await start_http(restarted)
+        try:
+            async with self.client.get(
+                url + "/internal/v1/model-requests/unmetered-restart",
+                headers={"Authorization": "Bearer " + SECRETS["TS041_TEST_CLIENT"]},
+            ) as response:
+                self.assertEqual(response.status, 200)
+                receipt = await response.json()
+            async with self.client.get(
+                url + USAGE_PATH + query(window(view="attempts")),
+                headers={"Authorization": "Bearer " + SECRETS["TS041_TEST_CLIENT"]},
+            ) as response:
+                self.assertEqual(response.status, 200)
+                after = await response.json()
+        finally:
+            await runner.cleanup()
+        # The authoritative receipt is the same record the crashed-metric build wrote, and
+        # the report still counts the attempt as unmetered rather than as a zero success.
+        self.assertEqual(receipt["outcome"], "succeeded")
+        self.assertEqual(after["counts"]["total"], 0)
+        self.assertEqual(after["coverage"]["unmetered_total"], 1)
+        self.assertEqual(after["usage"]["attempts"], 0)
 
 
 class UsageCliTests(unittest.IsolatedAsyncioTestCase):

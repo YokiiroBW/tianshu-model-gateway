@@ -13,16 +13,24 @@ rows, the vendor-native usage structure stays in the receipt, and no message bod
 argument, credential or provider URL is duplicated here. The tables are added in place by
 an explicit migration that first copies an existing deployment database, and the
 pre-existing tables are never altered, so an older gateway build keeps opening the file.
+
+The metric row is pure observation and is written in its own transaction, after the
+authoritative terminal receipt. A failure to write it may never roll the receipt back,
+abort bytes already delivered to a caller, or be retried: the attempt then simply has no
+private row and the report counts it as unmetered instead of as zero.
 """
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import time
 from dataclasses import dataclass
 
 from .contracts import Rejected
+
+LOG = logging.getLogger("tianshu_gateway")
 
 NATIVE_IDENTITY_FIELDS = ("contract", "principal_id", "caller_service", "credential_namespace")
 
@@ -46,6 +54,24 @@ USAGE_SOURCES = (
     "not_reported",
     "unobserved",
 )
+# Largest normalized token count this private projection indexes (a thousand trillion
+# tokens is already far beyond any real attempt). The bound keeps every stored value inside
+# a SQLite signed 64-bit integer and keeps a bounded aggregate away from integer overflow:
+# MAX_METRIC_TOKENS * MAX_LIMIT stays below 2**63. A larger upstream value is left in the
+# authoritative receipt, is not indexed here, and leaves the projection explicitly
+# incomplete instead of being truncated or invented.
+MAX_METRIC_TOKENS = 10**15
+
+
+def metric_tokens(value):
+    """The token count this projection may index, or ``None`` for anything else.
+
+    Values outside the documented bound are not clamped: they are not indexed at all, so a
+    report can never present a truncated number as the value a provider reported.
+    """
+    if type(value) is not int or not 0 <= value <= MAX_METRIC_TOKENS:
+        return None
+    return value
 
 
 def redact(value, secrets):
@@ -94,7 +120,7 @@ class AttemptMetrics:
             raise ValueError("invalid usage completeness")
         for name in ("input_tokens", "output_tokens"):
             value = getattr(self, name)
-            if value is not None and (type(value) is not int or value < 0):
+            if value is not None and metric_tokens(value) is None:
                 raise ValueError("invalid normalized token count")
 
 
@@ -102,20 +128,31 @@ UNOBSERVED = AttemptMetrics()
 
 
 def attempt_metrics(receipt, observer, elapsed_ms, stream, inspected):
-    """Project one finished attempt into private metrics.
+    """Project one finished attempt into private metrics; never raises.
 
     ``observer`` is the bounded SSE observer of this attempt, or ``None`` for a
     non-streaming call. ``inspected`` says whether a complete upstream response was read
     and examined, which is what separates "the provider reported no usage" from "no usage
     could be observed". The normalized input/output counts are read from the receipt's
     projection; the vendor-native structure is deliberately not copied or aggregated.
+
+    A value the private projection cannot index (for example an upstream token count
+    beyond the SQLite-safe bound) is not indexed here: it stays authoritative in the
+    receipt, the row is marked incomplete, and no truncated number is ever presented as
+    the reported one. This projection is observation only, so any unexpected failure
+    degrades to :data:`UNOBSERVED` instead of reaching the transfer path.
     """
+    try:
+        return _project_metrics(receipt, observer, elapsed_ms, stream, inspected)
+    except Exception:
+        # Observation must never change what a caller receives or what the receipt says.
+        LOG.warning("metric_projection_degraded")
+        return UNOBSERVED
+
+
+def _project_metrics(receipt, observer, elapsed_ms, stream, inspected):
     usage = receipt.get("usage")
     usage = usage if isinstance(usage, dict) else {}
-
-    def tokens(key):
-        value = usage.get(key)
-        return value if type(value) is int and value >= 0 else None
 
     if receipt.get("native_usage") is not None:
         source = "upstream_stream_usage" if stream else "upstream_json_usage"
@@ -130,14 +167,23 @@ def attempt_metrics(receipt, observer, elapsed_ms, stream, inspected):
         # sub-millisecond ordering of two successive clock reads.
         return min(value, elapsed_ms)
 
+    input_tokens = metric_tokens(usage.get("input_tokens"))
+    output_tokens = metric_tokens(usage.get("output_tokens"))
     return AttemptMetrics(
         first_upstream_byte_ms=timing("first_upstream_byte_ms"),
         first_event_ms=timing("first_event_ms"),
         first_output_ms=timing("first_output_ms"),
         usage_source=source,
-        input_tokens=tokens("input_tokens"),
-        output_tokens=tokens("output_tokens"),
-        usage_complete=receipt.get("usage_complete") is True,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        # A row is complete only when it actually indexed both normalized values: an
+        # upstream count that could not be indexed leaves the projection incomplete even
+        # though the authoritative receipt still says the provider reported both.
+        usage_complete=(
+            receipt.get("usage_complete") is True
+            and input_tokens is not None
+            and output_tokens is not None
+        ),
     )
 
 
@@ -291,10 +337,15 @@ class Diagnostics:
             raise Rejected("idempotency_conflict", 409) from None
 
     def finish(self, receipt, reason, elapsed_ms, upstream_status, metrics=UNOBSERVED):
-        """Persist the terminal receipt and this attempt's private metric row together.
+        """Persist the authoritative terminal receipt, then the private metric row.
 
-        The metric row is keyed by the same identity as the receipt, so a repeated
-        terminal observation replaces the earlier row instead of adding a second one.
+        The two writes are separate transactions on purpose. The receipt is the
+        authoritative record of the attempt, so a failure to write it must still surface.
+        The metric row is pure observation: a binding, constraint or disk failure there
+        leaves the receipt authoritative, counts the attempt as unmetered in the report,
+        and never changes the bytes already delivered to the caller. The metric row is
+        keyed by the same identity as the receipt, so a repeated terminal observation
+        replaces the earlier row instead of adding a second one.
         """
         with self.connection:
             self.connection.execute(
@@ -308,24 +359,42 @@ class Diagnostics:
                     receipt["request_id"],
                 ),
             )
-            self.connection.execute(
-                "INSERT OR REPLACE INTO request_metrics "
-                "(service, request_id, completed_at_ms, first_upstream_byte_ms, first_event_ms, "
-                "first_output_ms, usage_source, input_tokens, output_tokens, usage_complete) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (
-                    receipt["caller_service"],
-                    receipt["request_id"],
-                    int(time.time() * 1000),
-                    metrics.first_upstream_byte_ms,
-                    metrics.first_event_ms,
-                    metrics.first_output_ms,
-                    metrics.usage_source,
-                    metrics.input_tokens,
-                    metrics.output_tokens,
-                    int(metrics.usage_complete),
-                ),
-            )
+        self.project_metric(
+            "request_metrics",
+            "INSERT OR REPLACE INTO request_metrics "
+            "(service, request_id, completed_at_ms, first_upstream_byte_ms, first_event_ms, "
+            "first_output_ms, usage_source, input_tokens, output_tokens, usage_complete) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                receipt["caller_service"],
+                receipt["request_id"],
+                int(time.time() * 1000),
+                metrics.first_upstream_byte_ms,
+                metrics.first_event_ms,
+                metrics.first_output_ms,
+                metrics.usage_source,
+                metrics.input_tokens,
+                metrics.output_tokens,
+                int(metrics.usage_complete),
+            ),
+        )
+
+    def project_metric(self, table, statement, values):
+        """Best-effort private projection of one finished attempt.
+
+        Diagnostics never change the transfer outcome: a failure here is logged as a
+        bounded, value-free degradation and the attempt keeps no private row. It is not
+        retried, it does not roll back the receipt, and the report counts it under
+        ``coverage.unmetered_total`` rather than as zero usage or zero latency.
+        """
+        try:
+            with self.connection:
+                self.connection.execute(statement, values)
+        except Exception:
+            # Neither the values nor the exception text is logged; both can carry
+            # provider-supplied content and the missing row is already visible in the
+            # report. Cancellation is a BaseException and still propagates.
+            LOG.warning("metric_write_degraded table=%s", table)
 
     def get(self, service, request_id):
         row = self.connection.execute(
@@ -386,6 +455,12 @@ class Diagnostics:
             raise Rejected("idempotency_conflict", 409) from None
 
     def native_finish(self, receipt, reason, elapsed_ms, upstream_status, metrics=UNOBSERVED):
+        """Persist the authoritative native terminal receipt, then the private metric row.
+
+        Same separation as the Chat terminal: a repeated observation replaces the metric
+        row, and a metric failure never rolls back the native receipt or the delivered
+        native bytes.
+        """
         identity = native_identity(receipt)
         with self.connection:
             self.connection.execute(
@@ -399,25 +474,26 @@ class Diagnostics:
                     receipt["request_id"],
                 ),
             )
-            self.connection.execute(
-                "INSERT OR REPLACE INTO native_request_metrics "
-                "(contract, principal_id, caller_service, credential_namespace, request_id, "
-                "completed_at_ms, first_upstream_byte_ms, first_event_ms, first_output_ms, "
-                "usage_source, input_tokens, output_tokens, usage_complete) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    *identity,
-                    receipt["request_id"],
-                    int(time.time() * 1000),
-                    metrics.first_upstream_byte_ms,
-                    metrics.first_event_ms,
-                    metrics.first_output_ms,
-                    metrics.usage_source,
-                    metrics.input_tokens,
-                    metrics.output_tokens,
-                    int(metrics.usage_complete),
-                ),
-            )
+        self.project_metric(
+            "native_request_metrics",
+            "INSERT OR REPLACE INTO native_request_metrics "
+            "(contract, principal_id, caller_service, credential_namespace, request_id, "
+            "completed_at_ms, first_upstream_byte_ms, first_event_ms, first_output_ms, "
+            "usage_source, input_tokens, output_tokens, usage_complete) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                *identity,
+                receipt["request_id"],
+                int(time.time() * 1000),
+                metrics.first_upstream_byte_ms,
+                metrics.first_event_ms,
+                metrics.first_output_ms,
+                metrics.usage_source,
+                metrics.input_tokens,
+                metrics.output_tokens,
+                int(metrics.usage_complete),
+            ),
+        )
 
     def native_get(self, identity, request_id):
         row = self.connection.execute(
