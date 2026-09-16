@@ -4,19 +4,27 @@ import argparse
 import ipaddress
 import logging
 import ssl
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from .config import ClientGrant
-from .contracts import loads
-from .native import NativeGrant
-from .server import Settings, create_app
+from .server import create_app, load_settings
+
+USAGE_REPORT = "usage-report"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TS-041 native model gateway")
+    # A fixed leading word selects the read-only local report; everything else keeps the
+    # existing server interface byte for byte.
+    if sys.argv[1:2] == [USAGE_REPORT]:
+        from .usage_report import main as report_main
+
+        sys.exit(report_main(sys.argv[2:]))
+    parser = argparse.ArgumentParser(
+        description="TS-041 native model gateway (subcommand: usage-report)"
+    )
     parser.add_argument(
         "--settings", required=True, help="deployment JSON (references, not secrets)"
     )
@@ -41,11 +49,7 @@ def main():
             tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             tls.minimum_version = ssl.TLSVersion.TLSv1_2
             tls.load_cert_chain(args.tls_cert, args.tls_key)
-        data = loads(Path(args.settings).read_bytes())
-        data["clients"] = [ClientGrant(**client) for client in data["clients"]]
-        if data.get("native_clients") is not None:
-            data["native_clients"] = [NativeGrant(**grant) for grant in data["native_clients"]]
-        settings = Settings(**data)
+        settings = load_settings(Path(args.settings).read_bytes())
         if args.local_test:
             if not all(
                 ipaddress.ip_address(ip).is_loopback

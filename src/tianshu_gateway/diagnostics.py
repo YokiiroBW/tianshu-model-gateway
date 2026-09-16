@@ -4,15 +4,48 @@ The Chat tables and the native tables are separate key spaces. A native version 
 written into the Chat ``configs``/``revoked`` chain, and native receipts are keyed by
 contract plus trusted principal, caller service and credential namespace, so a request ID
 alone never addresses another subject's record.
+
+TS-043 adds two private metric tables for usage and latency diagnostics. They index only
+facts the receipt chain cannot answer with a bounded SQL query: the wall-clock completion
+instant, the three monotonic stream timings, the usage provenance and the normalized
+token counts. Reason, upstream status and elapsed time are still read from the existing
+rows, the vendor-native usage structure stays in the receipt, and no message body, tool
+argument, credential or provider URL is duplicated here. The tables are added in place by
+an explicit migration that first copies an existing deployment database, and the
+pre-existing tables are never altered, so an older gateway build keeps opening the file.
 """
 
 import hashlib
 import json
+import os
 import sqlite3
+import time
+from dataclasses import dataclass
 
 from .contracts import Rejected
 
 NATIVE_IDENTITY_FIELDS = ("contract", "principal_id", "caller_service", "credential_namespace")
+
+CORE_TABLES = (
+    "requests",
+    "turns",
+    "revoked",
+    "configs",
+    "native_configs",
+    "native_revoked",
+    "native_requests",
+    "native_turns",
+)
+MIGRATION_VERSION = 1
+BACKUP_SUFFIX = ".ts043-backup"
+# Where an observed usage value came from. A missing value is never reported as zero, and
+# an attempt that never inspected a complete upstream response is not "no usage reported".
+USAGE_SOURCES = (
+    "upstream_json_usage",
+    "upstream_stream_usage",
+    "not_reported",
+    "unobserved",
+)
 
 
 def redact(value, secrets):
@@ -33,11 +66,123 @@ def native_identity(document):
     return tuple(document[field] for field in NATIVE_IDENTITY_FIELDS)
 
 
+@dataclass(frozen=True)
+class AttemptMetrics:
+    """New performance facts for one attempt; not a second copy of the receipt.
+
+    Every timing is monotonic milliseconds since the attempt started and stays ``None``
+    when it was not observed: a missing first-event latency is never recorded as zero and
+    never stands in for model generation time.
+    """
+
+    first_upstream_byte_ms: int | None = None
+    first_event_ms: int | None = None
+    first_output_ms: int | None = None
+    usage_source: str = "unobserved"
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    usage_complete: bool = False
+
+    def __post_init__(self):
+        for name in ("first_upstream_byte_ms", "first_event_ms", "first_output_ms"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError("invalid metric timing")
+        if self.usage_source not in USAGE_SOURCES:
+            raise ValueError("invalid usage source")
+        if type(self.usage_complete) is not bool:
+            raise ValueError("invalid usage completeness")
+        for name in ("input_tokens", "output_tokens"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError("invalid normalized token count")
+
+
+UNOBSERVED = AttemptMetrics()
+
+
+def attempt_metrics(receipt, observer, elapsed_ms, stream, inspected):
+    """Project one finished attempt into private metrics.
+
+    ``observer`` is the bounded SSE observer of this attempt, or ``None`` for a
+    non-streaming call. ``inspected`` says whether a complete upstream response was read
+    and examined, which is what separates "the provider reported no usage" from "no usage
+    could be observed". The normalized input/output counts are read from the receipt's
+    projection; the vendor-native structure is deliberately not copied or aggregated.
+    """
+    usage = receipt.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+
+    def tokens(key):
+        value = usage.get(key)
+        return value if type(value) is int and value >= 0 else None
+
+    if receipt.get("native_usage") is not None:
+        source = "upstream_stream_usage" if stream else "upstream_json_usage"
+    else:
+        source = "not_reported" if inspected else "unobserved"
+
+    def timing(attribute):
+        value = getattr(observer, attribute, None) if observer is not None else None
+        if type(value) is not int or value < 0:
+            return None
+        # Both values come from the same monotonic start; the clamp only removes the
+        # sub-millisecond ordering of two successive clock reads.
+        return min(value, elapsed_ms)
+
+    return AttemptMetrics(
+        first_upstream_byte_ms=timing("first_upstream_byte_ms"),
+        first_event_ms=timing("first_event_ms"),
+        first_output_ms=timing("first_output_ms"),
+        usage_source=source,
+        input_tokens=tokens("input_tokens"),
+        output_tokens=tokens("output_tokens"),
+        usage_complete=receipt.get("usage_complete") is True,
+    )
+
+
+PRIVATE_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS request_metrics (
+        service TEXT NOT NULL, request_id TEXT NOT NULL, completed_at_ms INTEGER NOT NULL,
+        first_upstream_byte_ms INTEGER, first_event_ms INTEGER, first_output_ms INTEGER,
+        usage_source TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER,
+        usage_complete INTEGER NOT NULL,
+        PRIMARY KEY(service, request_id));
+    CREATE INDEX IF NOT EXISTS request_metrics_window
+        ON request_metrics(service, completed_at_ms, request_id);
+    CREATE TABLE IF NOT EXISTS native_request_metrics (
+        contract TEXT NOT NULL, principal_id TEXT NOT NULL, caller_service TEXT NOT NULL,
+        credential_namespace TEXT NOT NULL, request_id TEXT NOT NULL,
+        completed_at_ms INTEGER NOT NULL,
+        first_upstream_byte_ms INTEGER, first_event_ms INTEGER, first_output_ms INTEGER,
+        usage_source TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER,
+        usage_complete INTEGER NOT NULL,
+        PRIMARY KEY(contract, principal_id, caller_service, credential_namespace, request_id));
+    CREATE INDEX IF NOT EXISTS native_request_metrics_window
+        ON native_request_metrics(contract, principal_id, caller_service, credential_namespace,
+                                  completed_at_ms, request_id);
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+"""
+
+PRIVATE_TABLES = ("request_metrics", "native_request_metrics")
+
+
+def table_names(connection):
+    return {
+        row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+
+
 class Diagnostics:
     def __init__(self, path):
+        self.path = str(path)
         self.connection = sqlite3.connect(path)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=1000")
+        # Read the table set before creating anything, so a fresh database is not
+        # mistaken for an existing deployment that needs an upgrade copy.
+        deployed = table_names(self.connection)
         self.connection.executescript("""
             CREATE TABLE IF NOT EXISTS requests (
                 service TEXT NOT NULL, request_id TEXT NOT NULL, receipt TEXT NOT NULL,
@@ -71,6 +216,36 @@ class Diagnostics:
                 native_config_version INTEGER NOT NULL,
                 PRIMARY KEY(contract, principal_id, caller_service, credential_namespace, turn_id));
         """)
+        self.migration_backup = self.migrate(deployed)
+
+    def migrate(self, deployed):
+        """Add the private metric tables, copying an existing database first.
+
+        Only new tables are created: the pre-existing tables keep their exact shape, so a
+        deployment can move between this build and the previous one on the same file. An
+        already populated database is copied once, before the tables appear, to
+        ``<path>{suffix}``.
+        """
+        current = table_names(self.connection)
+        if set(PRIVATE_TABLES) <= current:
+            return None
+        backup = None
+        if set(deployed) & set(CORE_TABLES) and self.path != ":memory:":
+            candidate = self.path + BACKUP_SUFFIX
+            if not os.path.exists(candidate):
+                target = sqlite3.connect(candidate)
+                try:
+                    self.connection.backup(target)
+                finally:
+                    target.close()
+                backup = candidate
+        self.connection.executescript(PRIVATE_SCHEMA)
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO schema_migrations VALUES (?,?)",
+                (MIGRATION_VERSION, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+            )
+        return backup
 
     def remember_config(self, version, stable):
         digest = hashlib.sha256(
@@ -115,7 +290,12 @@ class Diagnostics:
         except sqlite3.IntegrityError:
             raise Rejected("idempotency_conflict", 409) from None
 
-    def finish(self, receipt, reason, elapsed_ms, upstream_status):
+    def finish(self, receipt, reason, elapsed_ms, upstream_status, metrics=UNOBSERVED):
+        """Persist the terminal receipt and this attempt's private metric row together.
+
+        The metric row is keyed by the same identity as the receipt, so a repeated
+        terminal observation replaces the earlier row instead of adding a second one.
+        """
         with self.connection:
             self.connection.execute(
                 "UPDATE requests SET receipt=?,reason=?,elapsed_ms=?,upstream_status=? WHERE service=? AND request_id=?",
@@ -126,6 +306,24 @@ class Diagnostics:
                     upstream_status,
                     receipt["caller_service"],
                     receipt["request_id"],
+                ),
+            )
+            self.connection.execute(
+                "INSERT OR REPLACE INTO request_metrics "
+                "(service, request_id, completed_at_ms, first_upstream_byte_ms, first_event_ms, "
+                "first_output_ms, usage_source, input_tokens, output_tokens, usage_complete) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    receipt["caller_service"],
+                    receipt["request_id"],
+                    int(time.time() * 1000),
+                    metrics.first_upstream_byte_ms,
+                    metrics.first_event_ms,
+                    metrics.first_output_ms,
+                    metrics.usage_source,
+                    metrics.input_tokens,
+                    metrics.output_tokens,
+                    int(metrics.usage_complete),
                 ),
             )
 
@@ -187,7 +385,7 @@ class Diagnostics:
         except sqlite3.IntegrityError:
             raise Rejected("idempotency_conflict", 409) from None
 
-    def native_finish(self, receipt, reason, elapsed_ms, upstream_status):
+    def native_finish(self, receipt, reason, elapsed_ms, upstream_status, metrics=UNOBSERVED):
         identity = native_identity(receipt)
         with self.connection:
             self.connection.execute(
@@ -199,6 +397,25 @@ class Diagnostics:
                     upstream_status,
                     *identity,
                     receipt["request_id"],
+                ),
+            )
+            self.connection.execute(
+                "INSERT OR REPLACE INTO native_request_metrics "
+                "(contract, principal_id, caller_service, credential_namespace, request_id, "
+                "completed_at_ms, first_upstream_byte_ms, first_event_ms, first_output_ms, "
+                "usage_source, input_tokens, output_tokens, usage_complete) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    *identity,
+                    receipt["request_id"],
+                    int(time.time() * 1000),
+                    metrics.first_upstream_byte_ms,
+                    metrics.first_event_ms,
+                    metrics.first_output_ms,
+                    metrics.usage_source,
+                    metrics.input_tokens,
+                    metrics.output_tokens,
+                    int(metrics.usage_complete),
                 ),
             )
 

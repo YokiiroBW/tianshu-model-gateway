@@ -12,11 +12,30 @@ import aiohttp
 
 from .config import read_limited, utcnow
 from .contracts import NATIVE_CONTRACT, Rejected, loads
-from .diagnostics import native_identity, redact
+from .diagnostics import attempt_metrics, native_identity, redact
 from .routing import SecretGuard, StreamObserver
 
 PROTOCOL = "openai-responses"
 TERMINALS = {"completed": "succeeded", "failed": "failed", "incomplete": "unknown"}
+# Recognized native lifecycle events that carry model output for the latency projection.
+# This is a local diagnostic set, not a protocol addition: an unknown event still counts
+# as the first observed event and simply leaves the first-output latency unobserved.
+OUTPUT_EVENT_KINDS = frozenset(
+    {
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.refusal.delta",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_text.delta",
+    }
+)
 
 
 def validate_request(raw):
@@ -96,8 +115,8 @@ def usage_projection(native):
 class ResponsesObserver(StreamObserver):
     """Reuse the bounded SSE line scanner, observing native typed lifecycle events."""
 
-    def __init__(self, limit=262144):
-        super().__init__(limit=limit)
+    def __init__(self, limit=262144, started=None):
+        super().__init__(limit=limit, started=started)
         self.status = None
         self.response_id = None
         self.terminal_usage = False
@@ -126,6 +145,8 @@ class ResponsesObserver(StreamObserver):
     def dispatch(self):
         if not self.data:
             return
+        if self.first_event_ms is None:
+            self.first_event_ms = self.elapsed_ms()
         try:
             if self.done:
                 raise Rejected()
@@ -142,6 +163,8 @@ class ResponsesObserver(StreamObserver):
                 self.observe_response(value.get("response"), kind[9:])
             elif "response" in value:
                 self.observe_response(value["response"])
+            if self.first_output_ms is None and kind in OUTPUT_EVENT_KINDS:
+                self.first_output_ms = self.elapsed_ms()
         except (Rejected, UnicodeError):
             self.invalid = True
 
@@ -216,11 +239,14 @@ async def send_responses(
     secrets = (*secrets, credential)
     receipt.update(outcome="unknown", usage=None, native_usage=None, usage_complete=False)
     receipt = redact(receipt, secrets)
-    observer = ResponsesObserver()
     upstream_status = None
     reason = "transport_unknown"
     started = time.monotonic()
+    observer = ResponsesObserver(started=started)
     complete = False
+    # True once a complete upstream response has been read and examined, which is what
+    # separates "the provider reported no usage" from "no usage could be observed".
+    inspected = False
     try:
         async with asyncio.timeout(timeout):
             async with session.post(
@@ -264,6 +290,7 @@ async def send_responses(
                         if safe:
                             await write(safe)
                     observer.end()
+                    inspected = True
                     # The upstream stream ended by itself, so every byte belongs downstream.
                     # Observation is a side channel: an observation shortfall (per-event
                     # budget, unparseable or unknown event, missing terminal) may only mark
@@ -278,6 +305,8 @@ async def send_responses(
                     raw = await read_limited(upstream.content, max_response_bytes)
                     guard.feed(raw, final=True)
                     native = loads(raw)
+                    if isinstance(native, dict):
+                        inspected = True
                     try:
                         if validate_response is not None:
                             validate_response(native)
@@ -312,9 +341,13 @@ async def send_responses(
         safe_receipt = redact(receipt, secrets)
         if validate_receipt is not None:
             validate_receipt(safe_receipt)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
         ledger.native_finish(
             safe_receipt,
             reason,
-            int((time.monotonic() - started) * 1000),
+            elapsed_ms,
             upstream_status,
+            attempt_metrics(
+                safe_receipt, observer, elapsed_ms, bool(body.get("stream")), inspected
+            ),
         )

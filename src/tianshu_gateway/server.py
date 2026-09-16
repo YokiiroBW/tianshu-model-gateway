@@ -28,7 +28,7 @@ from .contracts import (
     Rejected,
     loads,
 )
-from .diagnostics import Diagnostics, redact
+from .diagnostics import NATIVE_IDENTITY_FIELDS, Diagnostics, attempt_metrics, redact
 from .native import (
     NativeConfigCache,
     NativeConfigSource,
@@ -41,6 +41,7 @@ from .native import (
 )
 from .responses import send_responses, validate_request
 from .routing import PROTOCOL, SecretGuard, StreamObserver, apply_fields, prepare, record_usage
+from .usage import build_report
 
 LOG = logging.getLogger("tianshu_gateway")
 INTERNAL_HEADERS = {"x-tianshu-config-version", "x-tianshu-workload", "x-tianshu-turn-id"}
@@ -49,6 +50,10 @@ NATIVE_HEADERS = {
     "x-tianshu-turn-id",
 }
 NATIVE_ROUTE_HEADERS = {"x-request-id"} | NATIVE_HEADERS | {"authorization"}
+# Private, authenticated operations reads. They are not part of either published contract
+# and return no message body, tool argument, credential or provider URL.
+USAGE_PATH = "/internal/v1/model-usage"
+NATIVE_USAGE_PATH = "/internal/v1/native-model-usage"
 REQUEST_ID = web.RequestKey("request_id", str)
 FORWARD_STARTED = web.RequestKey("forward_started", bool)
 STREAM_RESPONSE = web.RequestKey("stream_response", web.StreamResponse)
@@ -288,6 +293,35 @@ class Gateway:
             redact(result, self.secrets.known_values()), headers={"Cache-Control": "no-store"}
         )
 
+    def usage_report(self, request, key_space, identity):
+        """Read-only projection of the authenticated caller's own metric rows."""
+        query = request.rel_url.query
+        if any(len(query.getall(name)) != 1 for name in query):
+            raise Rejected()
+        return web.json_response(
+            redact(
+                build_report(
+                    self.diagnostics.connection,
+                    key_space,
+                    identity,
+                    {name: query[name] for name in query},
+                ),
+                self.secrets.known_values(),
+            ),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def usage(self, request):
+        grant = self.authenticate(request)
+        return self.usage_report(request, "chat", {"service": grant.service})
+
+    async def native_usage(self, request):
+        """Only a currently authorized native identity may read its own history."""
+        grant = self.authenticate_native(request)
+        authorize(grant)
+        identity = dict(zip(NATIVE_IDENTITY_FIELDS, grant.identity(), strict=True))
+        return self.usage_report(request, "native", identity)
+
     async def chat(self, request):
         grant = self.authenticate(request)
         request_id, version, turn_id = self.context(request, grant)
@@ -511,6 +545,9 @@ class Gateway:
         reason = "transport_unknown"
         timeout = min(binding["timeout_ms"], self.settings.max_timeout_ms) / 1000
         started = time.monotonic()
+        # True once a complete upstream response has been read and examined, which is what
+        # separates "the provider reported no usage" from "no usage could be observed".
+        inspected = False
         try:
             # Includes reading and downstream backpressure; no retry or redirect middleware.
             async with asyncio.timeout(timeout):
@@ -539,7 +576,7 @@ class Gateway:
                     if body.get("stream"):
                         if content_type != "text/event-stream":
                             raise Rejected("result_unknown", 502, "unknown")
-                        observer = StreamObserver(body.get("n", 1))
+                        observer = StreamObserver(body.get("n", 1), started=started)
                         guard = SecretGuard(secrets)
                         response = web.StreamResponse(
                             status=upstream.status,
@@ -558,6 +595,7 @@ class Gateway:
                             if safe:
                                 await response.write(safe)
                         observer.end()
+                        inspected = True
                         if not observer.complete:
                             reason = "incomplete_stream"
                             raise Rejected("result_unknown", 502, "unknown")
@@ -572,6 +610,8 @@ class Gateway:
                         raw = await read_limited(upstream.content, self.settings.max_response_bytes)
                         SecretGuard(secrets).feed(raw, final=True)
                         native = loads(raw)
+                        if isinstance(native, dict):
+                            inspected = True
                         self.contracts.validate("model#native_response", native)
                         if "error" in native:
                             raise Rejected("result_unknown", 502, "unknown")
@@ -620,7 +660,15 @@ class Gateway:
             safe_receipt = redact(receipt, secrets)
             self.contracts.validate("model#route_receipt", safe_receipt)
             elapsed_ms = int((time.monotonic() - started) * 1000)
-            self.diagnostics.finish(safe_receipt, reason, elapsed_ms, upstream_status)
+            self.diagnostics.finish(
+                safe_receipt,
+                reason,
+                elapsed_ms,
+                upstream_status,
+                attempt_metrics(
+                    safe_receipt, observer, elapsed_ms, bool(body.get("stream")), inspected
+                ),
+            )
             LOG.info(
                 "model_request outcome=%s elapsed_ms=%d",
                 receipt["outcome"],
@@ -647,7 +695,11 @@ def error_response(exc, request_id, contract=None):
 
 
 def native_route(request):
-    return request.path == NATIVE_ROUTE_PATH or request.path.startswith(NATIVE_RECEIPT_PATH)
+    return (
+        request.path == NATIVE_ROUTE_PATH
+        or request.path.startswith(NATIVE_RECEIPT_PATH)
+        or request.path == NATIVE_USAGE_PATH
+    )
 
 
 @web.middleware
@@ -741,6 +793,12 @@ def create_app(settings):
     async def native_receipt(request):
         return await request.app[GATEWAY].native_read(request)
 
+    async def usage(request):
+        return await request.app[GATEWAY].usage(request)
+
+    async def native_usage(request):
+        return await request.app[GATEWAY].native_usage(request)
+
     async def unsupported(request):
         request.app[GATEWAY].authenticate(request)
         return error_response(Rejected("invalid_input", 501), request[REQUEST_ID])
@@ -754,12 +812,24 @@ def create_app(settings):
     app.cleanup_ctx.append(resources)
     app.router.add_post("/v1/chat/completions", chat)
     app.router.add_get("/internal/v1/model-requests/{request_id}", receipt)
+    app.router.add_get(USAGE_PATH, usage)
     for path in ("/v1/messages", "/v1/embeddings"):
         app.router.add_route("*", path, unsupported)
     if settings.native_enabled:
         app.router.add_post(NATIVE_ROUTE_PATH, native_responses)
         app.router.add_get(NATIVE_RECEIPT_PATH + "{request_id}", native_receipt)
+        app.router.add_get(NATIVE_USAGE_PATH, native_usage)
     else:
         # Native stays closed until a deployment explicitly enables it.
         app.router.add_route("*", NATIVE_ROUTE_PATH, native_disabled)
+        app.router.add_route("*", NATIVE_USAGE_PATH, native_disabled)
     return app
+
+
+def load_settings(raw):
+    """Parse one deployment document; both entry points use the same construction."""
+    data = loads(raw)
+    data["clients"] = [ClientGrant(**client) for client in data["clients"]]
+    if data.get("native_clients") is not None:
+        data["native_clients"] = [NativeGrant(**grant) for grant in data["native_clients"]]
+    return Settings(**data)

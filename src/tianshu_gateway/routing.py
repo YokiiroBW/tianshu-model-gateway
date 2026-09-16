@@ -2,6 +2,7 @@
 
 import copy
 import json
+import time
 
 from .config import utcnow
 from .contracts import Rejected, loads
@@ -161,11 +162,56 @@ def record_usage(receipt, native, complete):
     receipt["usage_complete"] = complete and len(usage) == 2
 
 
-class StreamObserver:
-    """Bounded SSE observer; never reserializes the outgoing bytes."""
+def chat_output(value):
+    """First model output on the wire: a real delta, never a keepalive or a terminal.
 
-    def __init__(self, expected_choices=1, limit=262144):
+    This is a diagnostic projection only. It never raises: an unrecognized shape simply
+    does not count as output, so a provider dialect we do not model can never turn a
+    forwardable stream into a failure.
+    """
+    choices = value.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        for key in ("content", "reasoning_content", "refusal"):
+            text = delta.get(key)
+            if isinstance(text, str) and text:
+                return True
+        calls = delta.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            if isinstance(call.get("id"), str) and call["id"]:
+                return True
+            function = call.get("function")
+            if isinstance(function, dict) and any(
+                isinstance(function.get(key), str) and function[key]
+                for key in ("name", "arguments")
+            ):
+                return True
+    return False
+
+
+class StreamObserver:
+    """Bounded SSE observer; never reserializes the outgoing bytes.
+
+    Beside the completion verdict it stamps three monotonic timings from the same start
+    instant as the attempt: the first upstream byte, the first complete SSE event on the
+    wire, and the first recognized model output. Stamping is additive bookkeeping - it
+    never rewrites, delays or drops a byte, so byte fidelity, backpressure, timeout,
+    cancellation and tool-call streaming are unchanged.
+    """
+
+    def __init__(self, expected_choices=1, limit=262144, started=None):
         self.expected_choices, self.limit = expected_choices, limit
+        self.started = time.monotonic() if started is None else started
         self.buffer = bytearray()
         self.data = []
         self.event_type = b""
@@ -173,10 +219,18 @@ class StreamObserver:
         self.done = self.invalid = self.error = False
         self.finished = set()
         self.native_usage = None
+        self.first_upstream_byte_ms = None
+        self.first_event_ms = None
+        self.first_output_ms = None
+
+    def elapsed_ms(self):
+        return int((time.monotonic() - self.started) * 1000)
 
     def feed(self, chunk):
         if self.invalid:
             return
+        if chunk and self.first_upstream_byte_ms is None:
+            self.first_upstream_byte_ms = self.elapsed_ms()
         self.buffer.extend(chunk)
         while True:
             positions = [i for i in (self.buffer.find(b"\n"), self.buffer.find(b"\r")) if i >= 0]
@@ -214,6 +268,8 @@ class StreamObserver:
     def dispatch(self):
         if not self.data:
             return
+        if self.first_event_ms is None:
+            self.first_event_ms = self.elapsed_ms()
         if self.event_type == b"error":
             self.error = True
         data = b"\n".join(self.data)
@@ -229,8 +285,13 @@ class StreamObserver:
                 raise Rejected()
             if "error" in value:
                 self.error = True
+            # A repeated usage-bearing chunk replaces the previous observation; usage is
+            # never summed or merged across fragments, so a duplicate terminal cannot
+            # count the same tokens twice.
             if isinstance(value.get("usage"), dict):
                 self.native_usage = value["usage"]
+            if self.first_output_ms is None and chat_output(value):
+                self.first_output_ms = self.elapsed_ms()
             for choice in value.get("choices", []):
                 index = choice.get("index")
                 finish = choice.get("finish_reason")

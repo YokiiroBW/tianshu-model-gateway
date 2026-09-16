@@ -14,9 +14,11 @@ Python 3.12+，依赖唯一入口 `pyproject.toml` / `uv.lock`。从本项目根
 
 ```powershell
 uv sync --locked --extra dev --python 'C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe'
-.venv/Scripts/ruff.exe check src tests/gateway_fixtures.py tests/test_gateway_http.py tests/test_gateway_boundaries.py
-.venv/Scripts/ruff.exe format --check src tests/gateway_fixtures.py tests/test_gateway_http.py tests/test_gateway_boundaries.py
+.venv/Scripts/ruff.exe check src tests/gateway_fixtures.py tests/test_gateway_http.py tests/test_gateway_boundaries.py tests/test_responses.py tests/test_responses_candidate.py tests/test_responses_native.py tests/test_usage_report.py
+.venv/Scripts/ruff.exe format --check src tests/gateway_fixtures.py tests/test_gateway_http.py tests/test_gateway_boundaries.py tests/test_responses.py tests/test_responses_candidate.py tests/test_responses_native.py tests/test_usage_report.py
 .venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_gateway*.py' -v
+.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_responses*.py' -v
+.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_usage_report.py' -v
 git diff --check
 ```
 
@@ -59,3 +61,17 @@ git diff --check
 `preserve_client` 保留客户端原生 JSON bytes（model/reasoning/store/未知字段），状态引用明确拒绝，无默认回退与自动重放；SSE 仅旁路观察不改字节，观察超预算、未知/无法解析事件或缺终态只把记账降级为 unknown 而不截断已收到的字节；只有真正的传输失败、超时、取消、断流与凭据反射才中止尝试。部署 JSON 的列表字段按数组书写，可直接启动真实 CLI。失效注册（撤销/过期/缺权限/无 native 版本授权）读取自己的回执也拒绝，native 版本撤销则保留历史审计。部署字段与边界见[运行说明](docs/gateway-runtime.md)，内部模块边界见[Responses 说明](docs/responses-internal.md)。
 
 本块验证：`.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_responses*.py' -v`（组件、候选包与 native 路由）；旧 Chat 回归沿用 `test_gateway*.py`。静态检查与格式检查覆盖 `src tests/gateway_fixtures.py tests/test_gateway_http.py tests/test_gateway_boundaries.py tests/test_responses.py tests/test_responses_candidate.py tests/test_responses_native.py`。以上只用 loopback 替身，不调用真实模型，也不代表平台生产者或生产接入已验收。
+
+## TS-043 用量与延迟诊断
+
+只读聚合建立在既有回执之上：`src/tianshu_gateway/usage.py` 在受限选择集内用 SQL 统计，`usage_report.py` 是本地运维 CLI，`server.py` 新注册两个读端口。
+
+```powershell
+.venv/Scripts/python.exe -B -m tianshu_gateway usage-report --settings .runtime/gateway-settings.json --service companion --view attempts --limit 50
+```
+
+- `GET /internal/v1/model-usage`（Chat）与 `GET /internal/v1/native-model-usage`（native，关闭时 501）按当前认证身份只返回自己的行，参数为 `view=summary|attempts`、`since`/`until`（ISO-8601 `Z`）、`limit`（≤5000）、`offset`（≤100000），窗口半开且上限 366 天，越界/未知/重复参数 400。
+- 计数分为成功/失败/取消/未知并恒等于总数；用量只聚合归一化 input/output tokens，来源显式（`upstream_json_usage`/`upstream_stream_usage`/`not_reported`/`unobserved`），缺失按缺失计数而不是 0，供应商原始结构不求和。
+- 延迟区分请求总耗时与首上游字节/首事件/首输出；未观察记 null。总耗时含背压，不代表模型生成耗时。
+- 新私有表 `request_metrics`/`native_request_metrics` 首次在既有部署上启动时先整库备份 `<ledger>.ts043-backup` 再建表，既有表与旧回执不变，缺新表的历史行计入 `coverage.unmetered_total`。不新增全量内容日志、后台遥测、全表内存扫描或费用估算，也不修改根 contracts 与依赖锁。
+- 命令、参数与验证界限见[运行说明](docs/gateway-runtime.md)，取舍见[TS-043 决定](docs/decisions/TS-043-usage-report.md)，交付见[TS-043 交接](docs/handoffs/TS-043.md)。

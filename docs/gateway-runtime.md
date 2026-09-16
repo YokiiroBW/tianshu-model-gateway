@@ -114,3 +114,17 @@
 - 回执读取按 (contract, principal, caller, namespace) 归属校验，且与 Chat 账本、Chat 撤销链完全分开：撤销 Chat 版本 7 不影响 native 7，反之亦然。
 - 上限沿用现有 `max_request_bytes`/`max_response_bytes`/`max_concurrent`/`max_provider_concurrent`/`max_timeout_ms`，上游总时限取 binding.timeout_ms 与该上限较小值。
 - 验证界限：`tests/test_responses_native.py` 用独立 loopback 端口启动平台替身（同时提供 Chat 与 native 快照）、录制上游与真实网关，并用 `dataclasses.asdict`→JSON 的部署文件启动真实 CLI 子进程；覆盖 JSON/SSE 字节保真、发布方 `validate.py` 的 `exchange()` 关系、错误状态、观察超预算/未知事件不截断、断流/取消/超时、部分/未知/零用量、撤权两个方向、失效身份回执拒绝与版本撤销保留审计、回执隔离、同号不串用与秘密反射；不代表平台生产者已实现、也不代表生产可用。当前接口在根包中仍为 `runtime_disabled_until_joint_acceptance`。
+
+## TS-043 用量与延迟诊断运行边界
+
+在既有回执之上新增一段**只读**聚合，不改根合同、不改既有回执字段、不新增公网未认证端点、不估费用、不写内容日志、不做全表内存扫描。
+
+- 读端口：`GET /internal/v1/model-usage`（Chat 键空间）与 `GET /internal/v1/native-model-usage`（native 键空间）。两者都要求 Bearer 认证：前者用已注册 Chat 客户端的独立凭据，后者用已注册 native 客户端凭据并再过一遍发布授权关系（revoked/过期/缺 `config.snapshot`/`native_config_versions` 为空一律 403）；native 关闭时不注册该路径，返回 501 `unsupported_operation`。无凭据 401，响应 `Cache-Control: no-store`。
+- 参数：`view=summary|attempts`（默认 `summary`）、`since`/`until`（ISO-8601、必须带 `Z`、UTC）、`limit`（1..5000，默认 500）、`offset`（0..100000，默认 0）。其他参数名、重复参数、非规范数字（如 `01`、`1.0`、`-1`）一律 400。窗口半开 `[since, until)`，`until` 默认取当前时刻，跨度上限 366 天，默认窗口 24 小时；因此与查询同一毫秒完成的尝试可能落在默认窗口之外，需要精确覆盖时显式传 `until`。
+- 身份与隔离：只按当前认证身份过滤（Chat 为 `service`，native 为 contract/principal/caller/namespace 四元组），不回显、不聚合其他调用方的行；键空间互不相通，Chat 凭据不能读 native 报告，native 凭据不能读 Chat 报告。响应含 `identity`、`window`、`coverage`、`counts`、`reasons`、`latency_ms`、`usage`、`notes`，`attempts` 视图另有逐次记录。
+- 计数：`total` 为本窗口扫描行数，`succeeded`/`failed`/`cancelled`/`unknown` 由持久 `reason` 与上游状态推出，四者按减法补齐，恒等于 `total`。`upstream_http_error` 只有 4xx 记 failed，其余保持 unknown；`cancelled_unknown` 记取消，`timeout_unknown`/`incomplete_stream`/`observation_incomplete`/传输失败保持 unknown。
+- 用量：只聚合归一化 `input_tokens`/`output_tokens`。`usage_source` 取 `upstream_json_usage`/`upstream_stream_usage`/`not_reported`/`unobserved`——`not_reported` 表示"已完整读到上游响应但它没报用量"，`unobserved` 表示"根本没读到可判定的响应"，两者都不是 0。缺失按 `missing` 计数而不是补 0；`usage_complete` 需要终态完成且 input/output 均已知。供应商原始 `native_usage` 只留在回执里，不参与求和（`vendor_fields_aggregated` 恒为 false）。
+- 延迟：`request_total_ms` 来自既有回执 `elapsed_ms`，含读取、上游传输与下游背压，**不是模型生成耗时**；`first_upstream_byte_ms`/`first_event_ms`/`first_output_ms` 用同一单调起点在本产品私有表记录，未观察为 `null` 而非 0。`first_event_ms` 是第一条可解析 SSE 事件（注释/心跳不算），`first_output_ms` 需已识别的输出事件；非流请求两者为 `null`，不能用总耗时冒充首字延迟。窗口内 `p50`/`p95` 为精确最近秩百分位（在受限选择集内排序，不扫全表）。
+- 私有表与迁移：新增 `request_metrics`、`native_request_metrics`、`schema_migrations`（均在 ledger 内，非根合同）。启动时若 ledger 已存在且含既有核心表，先整库复制为 `<ledger>.ts043-backup` 再建新表；既有表结构、行与旧版本兼容性都不变，新表缺失的历史行计入 `coverage.unmetered_total`。备份路径不自动清理。
+- CLI：`.venv/Scripts/python.exe -B -m tianshu_gateway usage-report --settings <部署.json> [--database <ledger>] [--view attempts] [--since ...] [--until ...] [--limit N] [--offset N] [--compact] --service <已注册服务>`，native 改用 `--principal-id`/`--caller-service`/`--credential-namespace`。它只读打开 ledger（`mode=ro`），要求身份仍注册、仍被授权且凭据仍可解析，没有"全量导出"模式；退出码 0 成功、2 参数/部署/ledger 不可用（含尚未迁移的 ledger）、3 身份被拒。不会因为一次读取而迁移或改写 ledger。
+- 验证界限：`tests/test_usage_report.py` 用独立 loopback 端口启动平台替身（Chat 与 native 快照）、录制上游与真实网关，覆盖 JSON/SSE 用量来源、用量缺失、重复并发请求只计一次、取消/超时/4xx 分桶、首事件延迟与总耗时的区别、分页与上限、跨身份与跨键空间隔离、撤权/过期/凭据失效读取拒绝、重启后报告一致、正文/工具参数/Key/URL 不外泄，另启动真实 CLI 子进程核对同一 ledger 的只读读取与拒绝路径。SQLite 通过不等于 PostgreSQL 通过；本段不代表生产容量、留存期限或平台侧配额已验收。
