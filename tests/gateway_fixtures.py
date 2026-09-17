@@ -182,6 +182,97 @@ class RecordingServices:
         self.native_response = copy.deepcopy(NATIVE_RESPONSE)
         self.native_response_bytes = b""
         self.cookie_value = "upstream-cookie-fixture"
+        # Reusable bounded fixture: every parked attempt gets its own event, so several
+        # attempts from the same caller can be parked at once and released one by one. The
+        # credential an attempt was forwarded with is recorded for filtering.
+        self.hold = {}
+        self.native_hold = {}
+        self.hold_order = []
+
+    def release_upstream(self, native=False):
+        for event in (self.native_hold if native else self.hold).values():
+            event.set()
+
+    def release_hold(self, token=None, select=None, native=False):
+        """Release parked attempts: all of them, those of one credential, or one selection.
+
+        ``token`` filters by the upstream credential the attempt was forwarded with, and
+        ``select`` by the 1-based arrival order of the parked attempts, so a test can keep one
+        caller's attempt in flight while another's is released.
+        """
+        events = self.native_hold if native else self.hold
+        for index, (key, event) in enumerate(events.items()):
+            credential = key.rsplit("#", 1)[0]
+            if token is not None and credential != token:
+                continue
+            if select is not None and index + 1 not in select:
+                continue
+            event.set()
+
+    async def wait_idle(self, native=False, timeout=2):
+        """Wait until no attempt is parked at the fixture, without guessing at timings."""
+        events = self.native_hold if native else self.hold
+
+        async def poll():
+            while any(not event.is_set() for event in events.values()):
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(poll(), timeout)
+
+    def call_count(self, native=False):
+        return len(self.native_calls if native else self.calls)
+
+    def held_count(self, native=False):
+        """How many attempts were forwarded at all: each one gets its own parked event."""
+        return len(self.native_hold if native else self.hold)
+
+    def held_events(self, token=None, native=False):
+        events = self.native_hold if native else self.hold
+        return [
+            event
+            for key, event in events.items()
+            if token is None or key.rsplit("#", 1)[0] == token
+        ]
+
+    def hold_attempt(self, credential, native=False):
+        """Create (or return) the event that parks the next attempt of this credential."""
+        events = self.native_hold if native else self.hold
+        attempt = sum(1 for key in events if key.rsplit("#", 1)[0] == credential) + 1
+        key = f"{credential}#{attempt}"
+        if not native:
+            self.hold_order.append(key)
+        return events.setdefault(key, asyncio.Event())
+
+    async def wait_hold(self, credential, native=False):
+        """Park until this attempt's own event, or the shared single-attempt event, is set.
+
+        ``hold`` gives every attempt its own event so a test can park several attempts of one
+        caller and release them one by one. The shared ``release``/``native_release`` event
+        stays the single-attempt latch earlier slices use, so both spellings release the same
+        parked attempt.
+        """
+        attempt = self.hold_attempt(credential, native=native)
+        shared = self.native_release if native else self.release
+        await asyncio.wait(
+            [asyncio.create_task(attempt.wait()), asyncio.create_task(shared.wait())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+    def attempt_headers(self, position, native=False):
+        """The recorded headers of one forwarded attempt, in arrival order."""
+        records = self.native_calls if native else self.calls
+        return records[position - 1][1]
+
+    async def wait_calls(self, count, native=False, timeout=2):
+        """Wait until the recording upstream has seen exactly ``count`` attempts."""
+        recorded = self.native_calls if native else self.calls
+
+        async def poll():
+            while len(recorded) < count:
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(poll(), timeout)
+        return [raw for raw, _ in recorded]
 
     def configure(self, upstream):
         self.config = copy.deepcopy(DOCUMENTS["config"])
@@ -247,11 +338,13 @@ class RecordingServices:
 
     async def upstream(self, request):
         raw = await request.read()
-        self.calls.append((raw, dict(request.headers)))
+        headers = dict(request.headers)
+        self.calls.append((raw, headers))
         self.started.set()
         try:
             if self.mode == "hold":
-                await self.release.wait()
+                token = headers.get("Authorization", "").removeprefix("Bearer ")
+                await self.wait_hold(token)
             if self.mode == "error":
                 return web.Response(
                     status=self.http_status,
@@ -309,9 +402,12 @@ class RecordingServices:
         raw = await request.read()
         self.native_calls.append((raw, dict(request.headers)))
         self.native_started.set()
+        held = False
         try:
-            if self.native_mode == "hold":
-                await self.native_release.wait()
+            if self.native_mode in {"hold", "stream_hold"}:
+                token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+                await self.wait_hold(token, native=True)
+                held = self.native_mode == "hold"
             if self.native_mode == "error":
                 return web.Response(
                     status=self.native_http_status,
@@ -331,7 +427,13 @@ class RecordingServices:
                         "Set-Cookie": "secret=" + SECRETS["TS042_TEST_NATIVE_UPSTREAM"],
                     },
                 )
-            if self.native_mode in {"stream", "drop", "sse_hold", "one_byte", "secret_stream"}:
+            if held or self.native_mode in {
+                "stream",
+                "drop",
+                "sse_hold",
+                "one_byte",
+                "secret_stream",
+            }:
                 response = web.StreamResponse(
                     headers={
                         "Content-Type": "text/event-stream",

@@ -7,7 +7,7 @@ import os
 import socket
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -139,6 +139,81 @@ class ClientGrant:
     config_version: int
     internal: bool = False
     allowed_versions: tuple[int, ...] = ()
+
+
+WORKLOAD_CLASSES = ("interactive", "background")
+
+
+@dataclass(frozen=True)
+class SchedulingPolicy:
+    """Local runtime policy for bounded admission; never part of a published contract.
+
+    These values are the deployment's own capacity policy. They do not change platform
+    model-configuration ownership, the configuration publication contract or upstream model
+    mapping, and they are read once at start-up from the deployment document.
+
+    ``interactive_reserve == 0`` keeps the previous behaviour exactly: no waiting at all and
+    an immediate ``queue_full`` when capacity is busy. Any positive reserve is what starts
+    the bounded pool. ``max_in_flight`` is the hard global limit; ``interactive_reserve``
+    slots of it are reserved for interactive work and may only be claimed by background work
+    while fewer than ``max_in_flight - interactive_reserve`` slots are in flight.
+    """
+
+    max_in_flight: int
+    max_provider_in_flight: int
+    interactive_reserve: int
+    max_queue_length: int
+    wait_timeout_ms: int
+
+    def validate(self):
+        for name in (
+            "max_in_flight",
+            "max_provider_in_flight",
+            "max_queue_length",
+            "wait_timeout_ms",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError("positive scheduling limit required")
+        if (
+            type(self.interactive_reserve) is not int
+            or self.interactive_reserve < 0
+            or self.interactive_reserve >= self.max_in_flight
+        ):
+            raise ValueError("interactive reserve must be below the global limit")
+        return self
+
+
+def default_policy(global_limit=16, provider_limit=4):
+    """The policy of a deployment that did not configure scheduling: immediate refusal."""
+    return SchedulingPolicy(global_limit, provider_limit, 0, 1, 1)
+
+
+@dataclass(frozen=True)
+class Classification:
+    """Which authenticated service belongs to which workload class.
+
+    The mapping is deployment-owned and explicit. It is never derived from a request body,
+    a request header, a model name or the protocol, and an external client with no binding
+    uses ``default_class`` instead of choosing a class for itself.
+    """
+
+    bindings: dict = field(default_factory=dict)
+    default_class: str = "interactive"
+
+    def validate(self):
+        if self.default_class not in WORKLOAD_CLASSES:
+            raise ValueError("invalid default workload class")
+        for service, workload_class in self.bindings.items():
+            if not isinstance(service, str) or not service:
+                raise ValueError("invalid bound service")
+            if workload_class not in WORKLOAD_CLASSES:
+                raise ValueError("invalid workload class")
+        return self
+
+    def for_service(self, service, declared_workload=None):
+        """The bound class of one authenticated service; the declared value is inert."""
+        return self.bindings.get(service, self.default_class)
 
 
 class SourceUnavailable(Rejected):

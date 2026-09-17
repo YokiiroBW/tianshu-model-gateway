@@ -231,8 +231,12 @@ class UsageBoundaryTests(unittest.TestCase):
             )
         }
         self.assertLessEqual({"request_metrics", "native_request_metrics"}, names)
+        # TS-044 adds one more independent step, so a ledger migrated here records both.
         self.assertEqual(
-            ledger.connection.execute("SELECT version FROM schema_migrations").fetchall(), [(1,)]
+            ledger.connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall(),
+            [(1,), (2,)],
         )
         # The pre-existing rows and tables are untouched: the older build still reads them.
         self.assertEqual(ledger.get("companion", "legacy-0")["outcome"], "unknown")

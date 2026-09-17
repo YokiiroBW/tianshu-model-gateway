@@ -11,11 +11,14 @@ import aiohttp
 from aiohttp import web
 
 from .config import (
+    Classification,
     ClientGrant,
     ConfigCache,
     EnvSecrets,
     HttpConfigSource,
     RegisteredTargets,
+    SchedulingPolicy,
+    default_policy,
     read_limited,
     utcnow,
 )
@@ -41,6 +44,7 @@ from .native import (
 )
 from .responses import send_responses, validate_request
 from .routing import PROTOCOL, SecretGuard, StreamObserver, apply_fields, prepare, record_usage
+from .scheduler import AdmissionRefused, BoundedAdmissionScheduler, bind
 from .usage import build_report
 
 LOG = logging.getLogger("tianshu_gateway")
@@ -81,6 +85,20 @@ class Settings:
     request_read_timeout: float = 5.0
     config_refresh_seconds: float = 30.0
     revoked_versions: list[int] = field(default_factory=list)
+    # TS-044 local runtime policy. Both are absent from an existing deployment document, and
+    # their defaults reproduce the previous behaviour exactly (no waiting, immediate refusal),
+    # so an old deployment keeps its exact semantics without being edited.
+    scheduling: SchedulingPolicy | None = None
+    workload_bindings: Classification | None = None
+
+    @property
+    def policy(self):
+        """The effective scheduling policy; ``None`` fields mean the historical defaults."""
+        return self.scheduling or default_policy(self.max_concurrent, self.max_provider_concurrent)
+
+    @property
+    def classification(self):
+        return self.workload_bindings or Classification()
 
     def validate(self):
         if not self.clients and not self.native_clients:
@@ -121,6 +139,14 @@ class Settings:
             raise ValueError("native material requires explicit enable")
         if any(type(v) is not int or v < 1 for v in self.revoked_native_versions):
             raise ValueError("invalid revoked native version")
+        # Scheduling is a local runtime policy; a half-valid policy must never start.
+        policy = self.policy
+        policy.validate()
+        self.classification.validate()
+        if policy.max_provider_in_flight > policy.max_in_flight:
+            raise ValueError("provider limit above the global limit")
+        if policy.interactive_reserve > policy.max_provider_in_flight:
+            raise ValueError("interactive reserve above the provider limit")
         if not self.native_enabled:
             return
         if not self.native_contract_directory:
@@ -134,9 +160,14 @@ class Settings:
 
 
 class Gateway:
-    def __init__(self, settings, contracts, targets, session, diagnostics):
+    def __init__(self, settings, contracts, targets, session, diagnostics, scheduler=None):
         self.settings, self.contracts, self.targets = settings, contracts, targets
         self.session, self.diagnostics = session, diagnostics
+        self.scheduler = scheduler
+        self.classification = settings.classification
+        if scheduler is not None and scheduler.diagnostics is None:
+            # The private admission projection is diagnostics; it never decides admission.
+            scheduler.diagnostics = diagnostics
         self.secrets = EnvSecrets(settings.secret_references)
         self.cache = ConfigCache(
             HttpConfigSource(
@@ -174,6 +205,56 @@ class Gateway:
             )
         self.active = 0
         self.provider_active = {}
+
+    @property
+    def idle(self):
+        """True when no attempt holds capacity and no request is still waiting."""
+        if self.scheduler is not None:
+            return self.scheduler.inflight == 0 and self.scheduler.waiting == 0
+        return self.active == 0
+
+    @property
+    def busy_providers(self):
+        if self.scheduler is not None:
+            return self.scheduler.provider_active
+        return {name: count for name, count in self.provider_active.items() if count}
+
+    def class_for(self, service):
+        """The deployment-bound class of one authenticated service.
+
+        This is the only place where a caller is mapped to a workload class, and the only
+        input is the authenticated registration. A request body, a model name, the protocol
+        or the client-declared ``X-Tianshu-Workload`` value can never change it: the declared
+        value is passed to the scheduler for observation only.
+        """
+        return self.classification.for_service(service)
+
+    def declared_workload(self, request, internal):
+        return request.headers.get("X-Tianshu-Workload") if internal else None
+
+    def slot(self, request, service, internal, key, provider_id):
+        """Capacity adapter for one attempt: the bounded pool or the historical counter.
+
+        The bounded pool is active only when the deployment reserved interactive capacity. A
+        reserve of zero means the previous behaviour, so such a deployment keeps the exact old
+        accounting (a plain counter, an immediate ``queue_full`` when capacity is busy) instead
+        of acquiring a queue it never asked for.
+        """
+        if self.pool_active:
+            return bind(
+                self.scheduler,
+                service,
+                self.class_for(service),
+                self.declared_workload(request, internal),
+                provider_id,
+                key,
+            )
+        return _CounterSlot(self, request, service, provider_id)
+
+    @property
+    def pool_active(self):
+        """True when this deployment runs the bounded pool instead of the plain counter."""
+        return self.scheduler is not None and self.settings.policy.interactive_reserve > 0
 
     def authenticate(self, request):
         token = request.headers.get("Authorization", "").removeprefix("Bearer ")
@@ -335,47 +416,53 @@ class Gateway:
         beta = request.headers.get("OpenAI-Beta", "")
         if len(beta) > 4096 or any(ord(c) < 32 or ord(c) > 126 for c in beta):
             raise Rejected()
-        if self.active >= self.settings.max_concurrent:
-            raise Rejected("queue_full", 429)
-        self.active += 1
-        provider_id = None
+        # The request is parsed and the pinned configuration read before capacity is taken:
+        # the provider is an input to admission, never something the scheduler guesses, and a
+        # request that will be rejected never occupies a permit while it is being rejected. A
+        # body that does not arrive inside the read deadline is still the client-visible 408.
         try:
             async with asyncio.timeout(self.settings.request_read_timeout):
                 raw = await read_limited(request.content, self.settings.max_request_bytes)
-            body = loads(raw)
-            self.contracts.validate("model#native_request", body)
-            config = await self.cache.get(version)
-            effective, provider, binding, receipt = prepare(
-                self.contracts, body, config, grant, request_id, grant.internal
-            )
-            selected_provider = provider["provider_id"]
-            if (
-                self.provider_active.get(selected_provider, 0)
-                >= self.settings.max_provider_concurrent
-            ):
-                raise Rejected("queue_full", 429)
-            credential = self.secrets.resolve(provider["credential_ref"])
-            self.targets.check(provider["base_url"])
-            # Recheck after awaited config access and before sending.
-            if self.diagnostics.is_revoked(version):
-                raise Rejected("forbidden", 403)
-            secrets = self.secrets.known_values()
-            receipt = redact(receipt, secrets)
-            self.contracts.validate("model#route_receipt", receipt)
-            self.diagnostics.begin(receipt, turn_id)
-            request[FORWARD_STARTED] = True
-            provider_id = selected_provider
-            self.provider_active[provider_id] = self.provider_active.get(provider_id, 0) + 1
-            payload = apply_fields(raw, effective, receipt["applied_policies"])
-            return await self.forward(
-                request, payload, effective, provider, binding, credential, receipt, secrets
-            )
         except TimeoutError:
             raise Rejected("timeout", 408) from None
-        finally:
-            self.active -= 1
-            if provider_id is not None:
-                self.provider_active[provider_id] -= 1
+        body = loads(raw)
+        self.contracts.validate("model#native_request", body)
+        config = await self.cache.get(version)
+        effective, provider, binding, receipt = prepare(
+            self.contracts, body, config, grant, request_id, grant.internal
+        )
+        credential = self.secrets.resolve(provider["credential_ref"])
+        self.targets.check(provider["base_url"])
+        # One launch key per logical client call: a repeated request ID may not occupy a
+        # second queue slot, and the key never leaves this attempt.
+        slot = self.slot(
+            request, grant.service, grant.internal, request_id, provider["provider_id"]
+        )
+        try:
+            async with slot:
+                # Everything below is re-verified after the wait, immediately before sending:
+                # the caller's permit, the pinned configuration's revocation state and the
+                # ledger outcome. A queued request that loses any of them is refused here
+                # instead of being forwarded on capacity it no longer has a right to use.
+                if not slot.live():
+                    raise Rejected("timeout", 408)
+                if self.diagnostics.is_revoked(version):
+                    raise Rejected("forbidden", 403)
+                secrets = self.secrets.known_values()
+                receipt = redact(receipt, secrets)
+                self.contracts.validate("model#route_receipt", receipt)
+                # A queued request is never recorded as forwarded: the ledger row is created
+                # after admission and only for an attempt that is about to be sent.
+                self.diagnostics.begin(receipt, turn_id)
+                request[FORWARD_STARTED] = True
+                payload = apply_fields(raw, effective, receipt["applied_policies"])
+                return await self.forward(
+                    request, payload, effective, provider, binding, credential, receipt, secrets
+                )
+        except AdmissionRefused as exc:
+            raise Rejected(exc.reason, exc.status) from None
+        except TimeoutError:
+            raise Rejected("timeout", 408) from None
 
     async def native_read(self, request):
         """Receipt read bound to the trusted identity, never to the request ID alone.
@@ -404,62 +491,60 @@ class Gateway:
             or request.headers.get("Content-Encoding")
         ):
             raise Rejected()
-        if self.active >= self.settings.max_concurrent:
-            raise Rejected("queue_full", 429)
-        self.active += 1
-        provider_id = None
+        # Parsed before capacity for the same reason as Chat: the pinned configuration selects
+        # the provider, and a request that fails validation must not hold a permit. A body that
+        # does not arrive inside the read deadline is the same client-visible refusal as before.
         try:
             async with asyncio.timeout(self.settings.request_read_timeout):
                 try:
                     raw = await read_limited(request.content, self.settings.max_request_bytes)
                 except Rejected:
                     raise Rejected("payload_too_large", 413) from None
-            # Native scope/state rejection precedes published shape checks.
-            body = validate_request(raw)
-            self.contracts.validate("native#native_request", body)
-            config = await self.native_cache.get(grant, version)
-            binding, provider = select_native_route(config, grant, body)
-            selected_version = config["native_config_version"]
-            selected_provider = provider["provider_id"]
-            if (
-                self.provider_active.get(selected_provider, 0)
-                >= self.settings.max_provider_concurrent
-            ):
-                raise Rejected("queue_full", 429)
-            credential = self.secrets.resolve(provider["credential_ref"])
-            self.targets.check(provider["base_url"])
-            # Recheck after awaited config access and before sending.
-            if self.native_ledger.native_is_revoked(grant.identity(), selected_version):
-                raise Rejected("forbidden", 403)
-            secrets = self.secrets.known_values()
-            context = route_context(grant, provider, request_id, turn_id, selected_version)
-            self.contracts.validate("native#route_context", context)
-            receipt = route_receipt(
-                grant,
-                provider,
-                body,
-                request_id,
-                selected_version,
-                utcnow().isoformat().replace("+00:00", "Z"),
-            )
-            receipt = redact(receipt, (*secrets, credential))
-            self.contracts.validate("native#route_receipt", receipt)
-            # Only a caller-supplied turn can be pinned; an external caller's turn id is a
-            # per-request correlation value, not a repeated client turn.
-            self.native_ledger.native_begin(receipt, turn_id if grant.internal else None)
-            request[FORWARD_STARTED] = True
-            provider_id = selected_provider
-            self.provider_active[provider_id] = self.provider_active.get(provider_id, 0) + 1
-            # preserve_client: the client's own native bytes are the upstream payload.
-            return await self.forward_native(
-                request, raw, binding, provider, credential, receipt, secrets
-            )
         except TimeoutError:
             raise Rejected("timeout", 408) from None
-        finally:
-            self.active -= 1
-            if provider_id is not None:
-                self.provider_active[provider_id] -= 1
+        # Native scope/state rejection precedes published shape checks.
+        body = validate_request(raw)
+        self.contracts.validate("native#native_request", body)
+        config = await self.native_cache.get(grant, version)
+        binding, provider = select_native_route(config, grant, body)
+        selected_version = config["native_config_version"]
+        credential = self.secrets.resolve(provider["credential_ref"])
+        self.targets.check(provider["base_url"])
+        slot = self.slot(
+            request, grant.service, grant.internal, request_id, provider["provider_id"]
+        )
+        try:
+            async with slot:
+                # Re-verified after the wait, immediately before anything is sent.
+                if not slot.live():
+                    raise Rejected("timeout", 408)
+                if self.native_ledger.native_is_revoked(grant.identity(), selected_version):
+                    raise Rejected("forbidden", 403)
+                secrets = self.secrets.known_values()
+                context = route_context(grant, provider, request_id, turn_id, selected_version)
+                self.contracts.validate("native#route_context", context)
+                receipt = route_receipt(
+                    grant,
+                    provider,
+                    body,
+                    request_id,
+                    selected_version,
+                    utcnow().isoformat().replace("+00:00", "Z"),
+                )
+                receipt = redact(receipt, (*secrets, credential))
+                self.contracts.validate("native#route_receipt", receipt)
+                # Only a caller-supplied turn can be pinned; an external caller's turn id is a
+                # per-request correlation value, not a repeated client turn.
+                self.native_ledger.native_begin(receipt, turn_id if grant.internal else None)
+                request[FORWARD_STARTED] = True
+                # preserve_client: the client's own native bytes are the upstream payload.
+                return await self.forward_native(
+                    request, raw, binding, provider, credential, receipt, secrets
+                )
+        except AdmissionRefused as exc:
+            raise Rejected(exc.reason, exc.status) from None
+        except TimeoutError:
+            raise Rejected("timeout", 408) from None
 
     async def forward_native(
         self, request, payload, binding, provider, credential, receipt, secrets
@@ -741,6 +826,53 @@ async def errors(request, handler):
 GATEWAY = web.AppKey("gateway", Gateway)
 
 
+class _CounterSlot:
+    """The bounded pool is off: capacity is the historical counter with a fast refusal.
+
+    This is the exact pre-TS-044 behaviour, kept for a deployment whose scheduling reserve is
+    zero. It performs no waiting, records no admission row and keeps the same
+    ``queue_full``/429 answer when either limit is busy.
+    """
+
+    __slots__ = ("gateway", "service", "provider_id", "_active")
+
+    def __init__(self, gateway, request, service, provider_id):
+        self.gateway, self.service, self.provider_id = gateway, service, provider_id
+        self._active = False
+
+    async def __aenter__(self):
+        # The historical order and status are preserved exactly: the global limit is checked
+        # first, then this provider's limit, and either busy limit is an immediate refusal.
+        if self.gateway.active >= self.gateway.settings.max_concurrent:
+            raise Rejected("queue_full", 429)
+        if (
+            self.gateway.provider_active.get(self.provider_id, 0)
+            >= self.gateway.settings.max_provider_concurrent
+        ):
+            raise Rejected("queue_full", 429)
+        self.gateway.active += 1
+        self.gateway.provider_active[self.provider_id] = (
+            self.gateway.provider_active.get(self.provider_id, 0) + 1
+        )
+        self._active = True
+        return self
+
+    async def __aexit__(self, *_):
+        self.release()
+        return False
+
+    def live(self):
+        """This path has no waiting, so an entered attempt always still holds its capacity."""
+        return True
+
+    def release(self):
+        if not self._active:
+            return
+        self._active = False
+        self.gateway.active -= 1
+        self.gateway.provider_active[self.provider_id] -= 1
+
+
 def create_app(settings):
     settings.validate()
     contracts = Contracts(
@@ -767,16 +899,27 @@ def create_app(settings):
                 for version in settings.revoked_native_versions:
                     # Independent key space: a native revocation never touches Chat rows.
                     diagnostics.native_revoke(grant.identity(), version)
-            connector = aiohttp.TCPConnector(
-                resolver=targets, limit=settings.max_concurrent + 1, ttl_dns_cache=0
+            # One in-memory pool for the whole process: Chat and native draw from it, so the
+            # same provider quota is never multiplied by the number of protocols or models.
+            scheduler = (
+                BoundedAdmissionScheduler(settings.policy, diagnostics)
+                if settings.policy.interactive_reserve > 0
+                else None
             )
+            # One pooled connection per possible in-flight attempt, plus the platform-config
+            # call. Kept at the same size as the admission limit so a full pool is refused or
+            # queued by the scheduler itself instead of blocking inside the connector.
+            pool = max(settings.max_concurrent, settings.policy.max_in_flight)
+            connector = aiohttp.TCPConnector(resolver=targets, limit=pool + 1, ttl_dns_cache=0)
             async with aiohttp.ClientSession(
                 connector=connector,
                 trust_env=False,
                 auto_decompress=False,
                 cookie_jar=aiohttp.DummyCookieJar(),
             ) as session:
-                app[GATEWAY] = Gateway(settings, contracts, targets, session, diagnostics)
+                app[GATEWAY] = Gateway(
+                    settings, contracts, targets, session, diagnostics, scheduler
+                )
                 yield
         finally:
             diagnostics.close()
@@ -832,4 +975,13 @@ def load_settings(raw):
     data["clients"] = [ClientGrant(**client) for client in data["clients"]]
     if data.get("native_clients") is not None:
         data["native_clients"] = [NativeGrant(**grant) for grant in data["native_clients"]]
+    # Both scheduling fields are optional; an existing document keeps the historical
+    # behaviour without being edited, and a document that carries them is validated here.
+    if data.get("scheduling") is not None:
+        data["scheduling"] = SchedulingPolicy(**data["scheduling"])
+    if data.get("workload_bindings") is not None:
+        bindings = data["workload_bindings"]
+        data["workload_bindings"] = Classification(
+            bindings.get("bindings") or {}, bindings.get("default_class", "interactive")
+        )
     return Settings(**data)

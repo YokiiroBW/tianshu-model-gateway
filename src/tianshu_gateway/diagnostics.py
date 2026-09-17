@@ -45,7 +45,16 @@ CORE_TABLES = (
     "native_turns",
 )
 MIGRATION_VERSION = 1
+# TS-044 adds the private admission table in a second, independent migration step. The
+# ledger therefore records which steps were applied instead of inferring it from the newest
+# table: a ledger migrated by the previous build keeps ``schema_migrations`` version 1 and
+# only gains the new table, so the older build still opens the same file.
+ADMISSION_MIGRATION = 2
 BACKUP_SUFFIX = ".ts043-backup"
+# Wait outcomes of one bounded-pool request. ``admitted`` means the caller proceeded to
+# re-verify and forward; the others never reached an upstream send. A waiter whose consumer
+# disappeared without a decision carries no outcome and no wait duration.
+ADMISSION_OUTCOMES = ("admitted", "queue_full", "deadline_exceeded", "cancelled")
 # Where an observed usage value came from. A missing value is never reported as zero, and
 # an attempt that never inspected a complete upstream response is not "no usage reported".
 USAGE_SOURCES = (
@@ -213,6 +222,17 @@ PRIVATE_SCHEMA = """
 
 PRIVATE_TABLES = ("request_metrics", "native_request_metrics")
 
+# The admission projection answers one question the receipt chain cannot: how long a request
+# waited inside the gateway's own bounded pool before capacity was granted, and what class
+# the deployment had bound it to. It stores no upstream fact, no request content and no
+# credential, and it is written by the scheduler, never by the forward path.
+ADMISSION_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS admission_metrics (
+        service TEXT NOT NULL, request_id TEXT NOT NULL, workload_class TEXT NOT NULL,
+        outcome TEXT NOT NULL, wait_ms INTEGER,
+        PRIMARY KEY(service, request_id));
+"""
+
 
 def table_names(connection):
     return {
@@ -265,15 +285,22 @@ class Diagnostics:
         self.migration_backup = self.migrate(deployed)
 
     def migrate(self, deployed):
-        """Add the private metric tables, copying an existing database first.
+        """Apply the private-schema steps in order, copying an existing database first.
 
         Only new tables are created: the pre-existing tables keep their exact shape, so a
         deployment can move between this build and the previous one on the same file. An
-        already populated database is copied once, before the tables appear, to
-        ``<path>{suffix}``.
+        already populated database is copied once, before the private tables appear, to
+        ``<path>{suffix}``. Each step is recorded in ``schema_migrations``, so a ledger that
+        was already migrated by an earlier build is recognised instead of being migrated
+        again, and a step that failed leaves no version row behind.
         """
         current = table_names(self.connection)
-        if set(PRIVATE_TABLES) <= current:
+        steps = []
+        if not set(PRIVATE_TABLES) <= current:
+            steps.append((MIGRATION_VERSION, PRIVATE_SCHEMA))
+        if "admission_metrics" not in current:
+            steps.append((ADMISSION_MIGRATION, ADMISSION_SCHEMA))
+        if not steps:
             return None
         backup = None
         if set(deployed) & set(CORE_TABLES) and self.path != ":memory:":
@@ -285,13 +312,49 @@ class Diagnostics:
                 finally:
                     target.close()
                 backup = candidate
-        self.connection.executescript(PRIVATE_SCHEMA)
-        with self.connection:
-            self.connection.execute(
-                "INSERT OR REPLACE INTO schema_migrations VALUES (?,?)",
-                (MIGRATION_VERSION, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
-            )
+        for version, script in steps:
+            self.connection.executescript(script)
+            with self.connection:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO schema_migrations VALUES (?,?)",
+                    (version, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+                )
         return backup
+
+    def applied_migrations(self):
+        try:
+            rows = self.connection.execute("SELECT version FROM schema_migrations").fetchall()
+        except sqlite3.Error:
+            # A ledger from before the private tables existed has no records at all.
+            return set()
+        return {row[0] for row in rows}
+
+    def record_admission(self, service, request_id, workload_class, outcome, wait_ms):
+        """Best-effort private projection of one admission decision.
+
+        This is pure observation: it runs before the slot is granted (or after a refusal)
+        and a failure here never changes the decision, never rolls back anything and never
+        reaches the caller. A bounded, value-free warning is the only trace, and a request
+        that could not be recorded simply has no admission row.
+        """
+        if outcome not in ADMISSION_OUTCOMES:
+            raise ValueError("invalid admission outcome")
+        if wait_ms is not None and (type(wait_ms) is not int or wait_ms < 0):
+            raise ValueError("invalid admission wait")
+        self.project_metric(
+            "admission_metrics",
+            "INSERT OR REPLACE INTO admission_metrics "
+            "(service, request_id, workload_class, outcome, wait_ms) VALUES (?,?,?,?,?)",
+            (service, request_id, workload_class, outcome, wait_ms),
+        )
+
+    def admission(self, service, request_id):
+        row = self.connection.execute(
+            "SELECT workload_class, outcome, wait_ms FROM admission_metrics "
+            "WHERE service=? AND request_id=?",
+            (service, request_id),
+        ).fetchone()
+        return None if row is None else tuple(row)
 
     def remember_config(self, version, stable):
         digest = hashlib.sha256(
