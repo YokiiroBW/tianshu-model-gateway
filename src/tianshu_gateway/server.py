@@ -165,9 +165,11 @@ class Gateway:
         self.session, self.diagnostics = session, diagnostics
         self.scheduler = scheduler
         self.classification = settings.classification
-        if scheduler is not None and scheduler.diagnostics is None:
-            # The private admission projection is diagnostics; it never decides admission.
-            scheduler.diagnostics = diagnostics
+        if scheduler is not None:
+            # One narrow port, no adapter: the scheduler forms bounded facts with no lock held
+            # and the private ledger records them. The scheduler holds no store of its own, and
+            # a failing or slow ledger can only lose a private row.
+            scheduler.record(self.diagnostics.record_admission)
         self.secrets = EnvSecrets(settings.secret_references)
         self.cache = ConfigCache(
             HttpConfigSource(
@@ -255,6 +257,31 @@ class Gateway:
     def pool_active(self):
         """True when this deployment runs the bounded pool instead of the plain counter."""
         return self.scheduler is not None and self.settings.policy.interactive_reserve > 0
+
+    def requeue_reverify(self, request, grant, native, provider):
+        """Re-read the caller's authority and credentials after the wait, before sending.
+
+        A request that waited is not the same request it was when it joined the queue: the
+        service credential can be withdrawn, a native grant can expire or be revoked, and the
+        pinned configuration can lapse or be revoked. Every one of them is re-read here from
+        the same authoritative sources the pre-queue path used -- the request's own bearer
+        token is re-authenticated against the current registrations, and the provider
+        credential reference is resolved again -- so a caller that lost its right to send is
+        refused instead of being forwarded on authority it no longer holds.
+
+        This never picks another provider, never retries and never substitutes a credential:
+        it either confirms the attempt that was already selected or refuses it. The returned
+        credential is the current value for the provider this attempt is pinned to.
+        """
+        current = self.authenticate_native(request) if native else self.authenticate(request)
+        if grant_identity(current) != grant_identity(grant):
+            # The token now belongs to a different registration: never send on the old one.
+            raise Rejected("unauthorized", 401)
+        if native:
+            authorize(current)
+        credential = self.secrets.resolve(provider["credential_ref"])
+        self.targets.check(provider["base_url"])
+        return credential
 
     def authenticate(self, request):
         token = request.headers.get("Authorization", "").removeprefix("Bearer ")
@@ -441,13 +468,16 @@ class Gateway:
         try:
             async with slot:
                 # Everything below is re-verified after the wait, immediately before sending:
-                # the caller's permit, the pinned configuration's revocation state and the
-                # ledger outcome. A queued request that loses any of them is refused here
-                # instead of being forwarded on capacity it no longer has a right to use.
+                # the caller's permit, the caller's own authority and credential, the pinned
+                # configuration's validity and revocation state, and the ledger outcome. A
+                # queued request that loses any of them is refused here instead of being
+                # forwarded on authority it no longer holds.
                 if not slot.live():
                     raise Rejected("timeout", 408)
-                if self.diagnostics.is_revoked(version):
-                    raise Rejected("forbidden", 403)
+                # Re-read from the pinned version, then re-authenticate the caller: an expired
+                # or revoked registration, or a withdrawn credential, must not reach upstream.
+                await self.cache.get(version)
+                credential = self.requeue_reverify(request, grant, False, provider)
                 secrets = self.secrets.known_values()
                 receipt = redact(receipt, secrets)
                 self.contracts.validate("model#route_receipt", receipt)
@@ -515,9 +545,18 @@ class Gateway:
         )
         try:
             async with slot:
-                # Re-verified after the wait, immediately before anything is sent.
+                # Re-verified after the wait, immediately before anything is sent: the permit,
+                # the native grant (expiry, revocation, permission, allowlist), the provider
+                # credential, the pinned native version's validity and the ledger outcome. A
+                # grant that lapsed while this request waited must not reach an upstream.
+                # Re-read the pinned native version (validity, revocation, caller allowlist)
+                # and the caller's own authority before anything is sent. A grant that lapsed
+                # while this request waited must not reach an upstream.
                 if not slot.live():
                     raise Rejected("timeout", 408)
+                await self.native_cache.get(grant, version)
+                credential = self.requeue_reverify(request, grant, True, provider)
+                # The ledger key space stays the version this attempt pinned before waiting.
                 if self.native_ledger.native_is_revoked(grant.identity(), selected_version):
                     raise Rejected("forbidden", 403)
                 secrets = self.secrets.known_values()
@@ -761,6 +800,19 @@ class Gateway:
             )
 
 
+def grant_identity(grant):
+    """The registered identity of either grant kind, for comparing a re-read authority.
+
+    Chat registrations and native grants have different fields; the comparison only needs to
+    answer "is this still the same registration", so each kind supplies its own tuple and the
+    two are never compared across kinds.
+    """
+    identity = getattr(grant, "identity", None)
+    if callable(identity):
+        return identity()
+    return (grant.service, grant.credential_ref, grant.provider_id, grant.config_version)
+
+
 def error_response(exc, request_id, contract=None):
     """Chat errors use the shared envelope; native paths use the published native one."""
     body = {
@@ -901,8 +953,10 @@ def create_app(settings):
                     diagnostics.native_revoke(grant.identity(), version)
             # One in-memory pool for the whole process: Chat and native draw from it, so the
             # same provider quota is never multiplied by the number of protocols or models.
+            # The private ledger is wired in as the scheduler's fact sink by the Gateway; the
+            # scheduler itself holds no store and performs no IO under its lock.
             scheduler = (
-                BoundedAdmissionScheduler(settings.policy, diagnostics)
+                BoundedAdmissionScheduler(settings.policy)
                 if settings.policy.interactive_reserve > 0
                 else None
             )

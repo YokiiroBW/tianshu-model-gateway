@@ -16,6 +16,7 @@ import socket
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import asdict
 from datetime import timedelta
@@ -113,15 +114,26 @@ class FakeClock:
 
 
 class FakeDiagnostics:
-    """The narrow observation port the scheduler is allowed to write."""
+    """The narrow fact sink the scheduler is allowed to hand observations to.
 
-    def __init__(self, fail=False):
+    It records the ledger's field names, exactly like the private port it stands in for, so a
+    change in the fact contract shows up here rather than silently passing.
+    """
+
+    def __init__(self, fail=False, delay=0.0):
         self.rows = []
         self.fail = fail
+        self.delay = delay
+        self.calls = 0
 
     def record_admission(self, service, request_id, workload_class, outcome, wait_ms):
+        self.calls += 1
         if self.fail:
             raise sqlite3.OperationalError("fixture failure " + SECRETS["TS041_TEST_UPSTREAM"])
+        if self.delay:
+            # A synchronous stand-in for a slow ledger: the point is that it is *not* called
+            # with the scheduler lock held, so a test can assert the lock is free meanwhile.
+            time.sleep(self.delay)
         self.rows.append((service, request_id, workload_class, outcome, wait_ms))
 
 
@@ -208,9 +220,10 @@ class SchedulerCoreTests(unittest.IsolatedAsyncioTestCase):
     def build(self, **overrides):
         self.clock = FakeClock()
         self.observed = FakeDiagnostics()
-        self.scheduler = BoundedAdmissionScheduler(
-            policy(**overrides), self.observed, clock=self.clock
-        )
+        self.scheduler = BoundedAdmissionScheduler(policy(**overrides), clock=self.clock)
+        # Wiring the observation port is the adapter's job, exactly as the gateway does it: the
+        # scheduler itself holds no store and performs no IO, in or out of its lock.
+        self.scheduler.record(self.observed.record_admission)
         return self.scheduler
 
     async def permit(self, service, workload_class, key, provider="provider-a", timeout_ms=1000):
@@ -222,6 +235,16 @@ class SchedulerCoreTests(unittest.IsolatedAsyncioTestCase):
     def acquiring(self, service, workload_class, key, provider="provider-a", *, timeout_ms=1000):
         """Start an acquisition without awaiting it, for queue and deadline cases."""
         return asyncio.create_task(self.permit(service, workload_class, key, provider, timeout_ms))
+
+    async def enrolled(self, *keys):
+        """Start the queue watcher with one scheduling turn, so enrollment cannot be missed."""
+        await asyncio.sleep(0)
+        await self.waiting_for(*keys)
+
+    async def settle(self, turns=3):
+        """Give the loop the same number of turns, for decisions that land after a release."""
+        for _ in range(turns):
+            await asyncio.sleep(0)
 
     async def waiting_for(self, *keys):
         """Wait until exactly these launch keys are queued, instead of guessing at timings."""
@@ -305,28 +328,30 @@ class SchedulerCoreTests(unittest.IsolatedAsyncioTestCase):
         # requests hold every slot of this provider and background work has to queue.
         queued = self.acquiring("memory-index", BACKGROUND, "b-2")
         await self.waiting_for("b-2")
-        # The first release is not enough for background work: the freed slot is the reserved
-        # one, and the interactive request that has been waiting longest takes it.
+        # The next free slot goes to the queued background request, even though an interactive
+        # request is already waiting behind it: the classes alternate, so a background request
+        # is never overtaken indefinitely by interactive work.
         interactive = self.acquiring("companion", INTERACTIVE, "i-3")
         await self.waiting_for("b-2", "i-3")
         await self.scheduler.release(held[0])
-        admitted = await asyncio.wait_for(interactive, 1)
-        self.assertEqual(admitted.workload_class, INTERACTIVE)
-        self.assertTrue(admitted.live())
-        self.assertFalse(queued.done())
-        # Once enough interactive requests have left, the queued background request is
-        # admitted: the queue is bounded, and it is never a starvation trap.
-        for waiter in held[1:]:
-            await self.scheduler.release(waiter)
         first_background = await asyncio.wait_for(queued, 1)
         self.assertEqual(first_background.workload_class, BACKGROUND)
         self.assertTrue(first_background.live())
+        # And the interactive request that was overtaken exactly once goes next.
+        await self.scheduler.release(held[1])
+        admitted = await asyncio.wait_for(interactive, 1)
+        self.assertEqual(admitted.workload_class, INTERACTIVE)
+        self.assertTrue(admitted.live())
+        # Running beside it, background still reaches its own capacity of two -- and no more,
+        # so the reserved interactive slot stays reachable. The interactive request admitted
+        # above comes first: it was already queued, so background waits one turn for the slot.
         self.assertEqual(self.scheduler.background_capacity(), 2)
-        # A second background request still runs beside the interactive ones, up to that
-        # background capacity, and a third one has to wait again rather than exceed it.
         beside = self.acquiring("memory-index", BACKGROUND, "b-3")
+        await self.waiting_for("b-3")
+        await self.scheduler.release(held[2])
         second_background = await asyncio.wait_for(beside, 1)
         self.assertTrue(second_background.live())
+        self.assertEqual(self.scheduler.background_claimed, 2)
         refused = self.acquiring("memory-index", BACKGROUND, "b-4", timeout_ms=20)
         with self.assertRaises(TimeoutError):
             await asyncio.wait_for(refused, 2)
@@ -463,6 +488,153 @@ class SchedulerCoreTests(unittest.IsolatedAsyncioTestCase):
         logged = " ".join(record.getMessage() for record in records)
         self.assertEqual(logged, "admission_metric_degraded outcome=admitted")
         self.assertNotIn(SECRETS["TS041_TEST_UPSTREAM"], logged)
+
+    async def test_a_cancelled_wait_never_strands_a_granted_permit(self):
+        # The decision can land in the same event-loop step as the cancellation, before the
+        # caller has taken delivery of the permit. That permit must be handed back: otherwise
+        # a caller that is gone still occupies global and provider capacity forever.
+        self.build(max_in_flight=2, max_provider_in_flight=2)
+        first = await self.permit("companion", INTERACTIVE, "i-1", "provider-a")
+        second = await self.permit("companion", INTERACTIVE, "i-2", "provider-a")
+        self.assertEqual(self.scheduler.inflight, 2)
+        pending = asyncio.create_task(self.permit("companion", INTERACTIVE, "i-3", "provider-a"))
+        await self.waiting_for("i-3")
+        # Release one permit, then cancel before the waiting task is resumed: the waiter is
+        # already admitted, and the consumer will never reach the permit.
+        await self.scheduler.release(first)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        await self.scheduler.release(second)
+        self.assertEqual(self.scheduler.inflight, 0)
+        self.assertEqual(self.scheduler.provider_active, {})
+        self.assertEqual(self.scheduler.interactive_claimed, 0)
+        self.assertEqual(self.scheduler.waiting, 0)
+        # The capacity is genuinely reusable, not merely reported as free.
+        again = await self.permit("companion", INTERACTIVE, "i-4", "provider-a")
+        self.assertTrue(again.live())
+        await self.scheduler.release(again)
+        await self.wait_idle()
+
+    async def test_a_deadline_that_races_the_decision_returns_the_permit(self):
+        # The same race with the waiting deadline instead of a cancellation: a waiter granted
+        # as its deadline expires must not leave capacity behind either.
+        self.build(max_in_flight=1, max_provider_in_flight=1, interactive_reserve=0)
+        first = await self.permit("companion", INTERACTIVE, "i-1", "provider-a")
+        pending = asyncio.create_task(
+            self.permit("companion", INTERACTIVE, "i-2", "provider-a", timeout_ms=1)
+        )
+        await self.waiting_for("i-2")
+        await asyncio.sleep(0.002)
+        await self.scheduler.release(first)
+        # Either the deadline won (TimeoutError) or the decision did; both must leave zero.
+        with self.assertRaises((TimeoutError, asyncio.CancelledError)):
+            await pending
+        self.assertEqual(self.scheduler.inflight, 0)
+        self.assertEqual(self.scheduler.provider_active, {})
+        self.assertEqual(self.scheduler.waiting, 0)
+        again = await self.permit("companion", INTERACTIVE, "i-3", "provider-a")
+        self.assertTrue(again.live())
+        await self.scheduler.release(again)
+        await self.wait_idle()
+
+    async def test_sustained_interactive_traffic_cannot_starve_background(self):
+        # The starvation case, reproduced exactly: a background request is queued, and every
+        # slot that frees up is immediately wanted by a newer interactive request. Interactive
+        # work keeps its reserved capacity, but it may overtake queued background work only a
+        # bounded number of times -- so background is served without waiting for the
+        # interactive stream to end. (The background pool ceiling itself is a separate, intended
+        # limit: while background already holds its whole allowance, a further background
+        # request necessarily waits for a background release, not for interactive work.)
+        self.build(max_in_flight=2, max_provider_in_flight=2, interactive_reserve=1)
+        first = await self.permit("companion", INTERACTIVE, "i-1", "provider-a")
+        second = await self.permit("companion", INTERACTIVE, "i-2", "provider-a")
+        self.assertEqual(self.scheduler.interactive_claimed, 2)
+        background = asyncio.create_task(
+            self.permit("memory-index", BACKGROUND, "b-1", "provider-a")
+        )
+        await self.enrolled("b-1")
+        await self.settle()
+        self.assertFalse(background.done())
+        rounds = 0
+        held = [first, second]
+        while not background.done() and rounds < 8:
+            fresh = asyncio.create_task(
+                self.permit("companion", INTERACTIVE, f"fresh-{rounds}", "provider-a")
+            )
+            await self.enrolled("b-1", f"fresh-{rounds}")
+            # A newer interactive request appears before the slot is freed, which is exactly how
+            # the starvation case is built.
+            await self.scheduler.release(held.pop(0))
+            await self.settle()
+            if background.done():
+                # Background was served while the newer interactive request is still queued: it
+                # was overtaken at most once, never overtaken indefinitely.
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(fresh, 1)
+            else:
+                held.append(await asyncio.wait_for(fresh, 1))
+            rounds += 1
+        self.assertTrue(background.done(), "background was never served")
+        self.assertLessEqual(rounds, 1)
+        admitted = await background
+        self.assertEqual(admitted.workload_class, BACKGROUND)
+        self.assertTrue(admitted.live())
+        # Capacity stays exactly as configured: one background slot, and the reserve still
+        # reachable for interactive work.
+        self.assertEqual(self.scheduler.background_capacity(), 1)
+        self.assertEqual(self.scheduler.background_claimed, 1)
+        self.assertLessEqual(self.scheduler.interactive_claimed, 1)
+        for waiter in held:
+            await self.scheduler.release(waiter)
+        await self.scheduler.release(admitted)
+        await self.wait_idle()
+        # The overtaking counter agrees with the bound the caller can rely on.
+        self.assertLessEqual(self.scheduler.waiting_overtakes(BACKGROUND), 1)
+
+    async def test_observation_never_runs_unless_the_scheduler_lock_is_free(self):
+        # The private ledger is a synchronous writer. It must never be reached while the
+        # scheduler lock is held, or one slow SQLite commit would stall every admission.
+        self.build(max_in_flight=1, max_provider_in_flight=1, interactive_reserve=0)
+        lock_was_free = []
+
+        def recording(**row):
+            lock_was_free.append(not self.scheduler.lock.locked())
+            return self.observed.record_admission(**row)
+
+        self.scheduler.record(recording)
+        first = await self.permit("companion", INTERACTIVE, "i-1", "provider-a")
+        # A queued request that never gets a turn still produces its deadline observation, and
+        # that one is emitted with the lock released too.
+        refused = self.acquiring("companion", INTERACTIVE, "i-2", timeout_ms=20)
+        await self.waiting_for("i-2")
+        with self.assertRaises(TimeoutError):
+            await refused
+        await self.scheduler.release(first)
+        # Every observation -- the grant and the deadline refusal -- was formed and emitted
+        # with the lock released.
+        self.assertEqual(lock_was_free, [True] * len(lock_was_free))
+        self.assertEqual(len(lock_was_free), 2)
+        self.assertEqual([row[3] for row in self.observed.rows], [ADMITTED, DEADLINE_EXCEEDED])
+
+    async def test_slow_observation_cannot_hold_up_admission(self):
+        # A slow ledger delays only its own rows: admission, release and the waiting deadline
+        # all keep working while the sink is busy.
+        self.build(max_in_flight=1, max_provider_in_flight=1, interactive_reserve=0)
+        self.observed.delay = 0.05
+        self.scheduler.record(self.observed.record_admission)
+        first = await self.permit("companion", INTERACTIVE, "i-1", "provider-a")
+        self.assertTrue(first.live())
+        refused = self.acquiring("companion", INTERACTIVE, "i-2", "provider-a", timeout_ms=5)
+        await self.waiting_for("i-2")
+        with self.assertRaises(TimeoutError):
+            await refused
+        await self.scheduler.release(first)
+        self.assertEqual(self.scheduler.inflight, 0)
+        self.assertEqual(self.scheduler.waiting, 0)
+        # One grant and one deadline: one slow write per fact, and the deadline was still
+        # honoured while the sink was busy.
+        self.assertEqual(self.observed.calls, 2)
 
     async def test_refusals_are_recorded_as_bounded_private_facts(self):
         self.build(max_in_flight=3, max_provider_in_flight=3, max_queue_length=1)
@@ -700,6 +872,11 @@ class ScheduledFixtures:
             self.url + "/v1/chat/completions", json=self.body, headers=headers
         )
 
+    async def native(self, headers):
+        return await self.client.post(
+            self.url + NATIVE_PATH, json=NATIVE_DOCUMENTS["native_request"], headers=headers
+        )
+
     async def wait_for(self, predicate, timeout=5):
         async def poll():
             while not predicate():
@@ -866,6 +1043,183 @@ class ScheduledScenarios:
             self.assertEqual(refused.status, 403)
         # The pinned version is re-read only after the wait, and the revocation stops the send.
         self.assertEqual(self.services.call_count(), self.global_limit)
+        await self.wait_for(lambda: self.gateway.idle)
+
+    async def test_a_queued_request_whose_credential_is_withdrawn_is_not_sent(self):
+        # Authority is re-read after the wait, not only before it: the same request that
+        # authenticated when it joined the queue must still authenticate when its turn comes.
+        self.services.mode = "hold"
+        held = [asyncio.create_task(self.chat(self.chat_headers("memory-index"))) for _ in range(2)]
+        await self.services.wait_calls(2)
+        blockers = [
+            asyncio.create_task(self.chat(self.chat_headers("companion")))
+            for _ in range(self.global_limit - 2)
+        ]
+        await self.wait_for(lambda: self.scheduler.inflight == self.global_limit)
+        queued = asyncio.create_task(
+            self.chat(self.chat_headers("memory-index", request_id="credential-withdrawn"))
+        )
+        await self.wait_for(lambda: self.scheduler.waiting == 1)
+        # The registration this queued caller authenticated with is withdrawn while it waits.
+        os.environ.pop("TS041_TEST_OTHER")
+        await self.release_held([*held, *blockers])
+        for task in [*held, *blockers]:
+            async with await task as finished:
+                self.assertEqual(finished.status, 200)
+        async with await queued as refused:
+            self.assertEqual(refused.status, 401)
+            self.assertEqual((await refused.json())["code"], "unauthorized")
+        # Nothing was sent on behalf of the withdrawn registration, and no capacity is stuck.
+        self.assertEqual(self.services.call_count(), self.global_limit)
+        self.assertEqual(self.scheduler.inflight, 0)
+        self.assertEqual(self.scheduler.waiting, 0)
+        await self.wait_for(lambda: self.gateway.idle)
+
+    async def test_an_internal_credential_withdrawn_during_the_wait_is_not_sent(self):
+        # The same rule for the service credential of the request that is waiting: the pool must
+        # not become a way to keep using a credential that was withdrawn after authentication.
+        self.services.mode = "hold"
+        held = [asyncio.create_task(self.chat(self.chat_headers("memory-index"))) for _ in range(2)]
+        await self.services.wait_calls(2)
+        blockers = [
+            asyncio.create_task(self.chat(self.chat_headers("companion")))
+            for _ in range(self.global_limit - 2)
+        ]
+        await self.wait_for(lambda: self.scheduler.inflight == self.global_limit)
+        # This caller is admitted and parked upstream, so its own credential can be withdrawn
+        # without disturbing the requests that are only there to fill the pool.
+        waiting_caller = asyncio.create_task(
+            self.chat(self.chat_headers("memory-index", request_id="internal-withdrawn"))
+        )
+        await self.wait_for(lambda: self.scheduler.waiting == 1)
+        os.environ.pop("TS041_TEST_OTHER")
+        await self.release_held([*held, *blockers])
+        for task in [*held, *blockers]:
+            async with await task as finished:
+                self.assertEqual(finished.status, 200)
+        async with await waiting_caller as refused:
+            self.assertEqual(refused.status, 401)
+        self.assertEqual(self.services.call_count(), self.global_limit)
+        self.assertEqual(self.scheduler.inflight, 0)
+        await self.wait_for(lambda: self.gateway.idle)
+
+    async def test_a_queued_request_whose_provider_credential_is_withdrawn_is_not_sent(self):
+        # The upstream credential is an input to sending, so it is re-read at send time too: a
+        # queued request must not be forwarded with a credential reference that no longer
+        # resolves, and it must not fall back to another one.
+        self.services.mode = "hold"
+        held = [asyncio.create_task(self.chat(self.chat_headers("memory-index"))) for _ in range(2)]
+        await self.services.wait_calls(2)
+        blockers = [
+            asyncio.create_task(self.chat(self.chat_headers("companion")))
+            for _ in range(self.global_limit - 2)
+        ]
+        await self.wait_for(lambda: self.scheduler.inflight == self.global_limit)
+        queued = asyncio.create_task(
+            self.chat(self.chat_headers("memory-index", request_id="provider-credential-gone"))
+        )
+        await self.wait_for(lambda: self.scheduler.waiting == 1)
+        os.environ.pop("TS041_TEST_UPSTREAM")
+        await self.release_held([*held, *blockers])
+        for task in [*held, *blockers]:
+            async with await task as finished:
+                self.assertEqual(finished.status, 200)
+        async with await queued as refused:
+            self.assertEqual(refused.status, 503)
+            self.assertEqual((await refused.json())["code"], "dependency_unavailable")
+        self.assertEqual(self.services.call_count(), self.global_limit)
+        self.assertEqual(self.scheduler.inflight, 0)
+        await self.wait_for(lambda: self.gateway.idle)
+
+    async def test_an_expired_native_grant_is_not_forwarded_after_the_wait(self):
+        # A native grant carries its own expiry, permissions and allowlist. All of them are
+        # re-evaluated after the wait, so a grant that lapsed while queued cannot send.
+        self.services.mode = "hold"
+        self.services.native_mode = "hold"
+        held = [asyncio.create_task(self.native(self.native_headers())) for _ in range(2)]
+        await self.services.wait_calls(2, native=True)
+        blockers = [
+            asyncio.create_task(self.native(self.native_headers()))
+            for _ in range(self.global_limit - 2)
+        ]
+        await self.wait_for(lambda: self.scheduler.inflight == self.global_limit)
+        queued = asyncio.create_task(
+            self.native(self.native_headers(request_id="native-grant-expired"))
+        )
+        await self.wait_for(lambda: self.scheduler.waiting == 1)
+        grant = self.settings.native_clients[0]
+        # The registration is a frozen value, so its expiry is moved through the one field the
+        # authorization rule reads; nothing else about the attempt changes.
+        object.__setattr__(
+            grant,
+            "expires_at",
+            (utcnow() - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+        )
+        await self.release_held([*held, *blockers])
+        for task in [*held, *blockers]:
+            async with await task as finished:
+                self.assertEqual(finished.status, 200)
+        async with await queued as refused:
+            self.assertEqual(refused.status, 403)
+        self.assertEqual(self.services.call_count(native=True), self.global_limit)
+        self.assertEqual(self.scheduler.inflight, 0)
+        await self.wait_for(lambda: self.gateway.idle)
+
+    async def test_a_native_version_revoked_during_the_wait_is_not_forwarded(self):
+        self.services.mode = "hold"
+        self.services.native_mode = "hold"
+        held = [asyncio.create_task(self.native(self.native_headers())) for _ in range(2)]
+        await self.services.wait_calls(2, native=True)
+        blockers = [
+            asyncio.create_task(self.native(self.native_headers()))
+            for _ in range(self.global_limit - 2)
+        ]
+        await self.wait_for(lambda: self.scheduler.inflight == self.global_limit)
+        queued = asyncio.create_task(
+            self.native(self.native_headers(request_id="native-revoked-while-queued"))
+        )
+        await self.wait_for(lambda: self.scheduler.waiting == 1)
+        self.gateway.native_ledger.native_revoke(self.settings.native_clients[0].identity(), 7)
+        await self.release_held([*held, *blockers])
+        for task in [*held, *blockers]:
+            async with await task as finished:
+                self.assertEqual(finished.status, 200)
+        async with await queued as refused:
+            self.assertEqual(refused.status, 403)
+        self.assertEqual(self.services.call_count(native=True), self.global_limit)
+        self.assertEqual(self.scheduler.inflight, 0)
+        await self.wait_for(lambda: self.gateway.idle)
+
+    async def test_a_refusal_after_the_wait_leaves_no_receipt_and_no_capacity(self):
+        # A request refused after the wait is refused exactly like one refused before it: no
+        # receipt row for an attempt that never started, and no capacity left behind.
+        self.services.mode = "hold"
+        held = [asyncio.create_task(self.chat(self.chat_headers("memory-index"))) for _ in range(2)]
+        await self.services.wait_calls(2)
+        blockers = [
+            asyncio.create_task(self.chat(self.chat_headers("companion")))
+            for _ in range(self.global_limit - 2)
+        ]
+        await self.wait_for(lambda: self.scheduler.inflight == self.global_limit)
+        queued = asyncio.create_task(
+            self.chat(self.chat_headers("memory-index", request_id="refused-after-wait"))
+        )
+        await self.wait_for(lambda: self.scheduler.waiting == 1)
+        self.gateway.cache.revoke(7)
+        await self.release_held([*held, *blockers])
+        for task in [*held, *blockers]:
+            async with await task as finished:
+                self.assertEqual(finished.status, 200)
+        async with await queued as refused:
+            self.assertEqual(refused.status, 403)
+        async with self.client.get(
+            self.url + "/internal/v1/model-requests/refused-after-wait",
+            headers={"Authorization": "Bearer " + SECRETS["TS041_TEST_OTHER"]},
+        ) as receipt:
+            self.assertEqual(receipt.status, 404)
+        self.assertEqual(self.scheduler.inflight, 0)
+        self.assertEqual(self.scheduler.provider_active, {})
+        self.assertEqual(self.scheduler.waiting, 0)
         await self.wait_for(lambda: self.gateway.idle)
 
     async def test_duplicate_request_id_never_holds_two_permits(self):

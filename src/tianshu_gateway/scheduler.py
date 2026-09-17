@@ -21,16 +21,24 @@ The ledger is process-local and in-memory on purpose:
   attempt that had already started survives;
 * every permit is released through one authoritative path (the adapter's guarded
   ``release``), so cancellation, timeout, disconnect and exception cannot free a permit
-  twice or leave one behind;
-* the caller re-verifies identity, configuration validity and idempotency after the permit
-  is granted, so nothing queued here is ever sent upstream by this module.
+  twice or leave one behind -- including a cancellation that lands *after* the decision but
+  *before* the caller has taken delivery of it;
+* the caller re-verifies identity, credential, configuration validity and idempotency after
+  the permit is granted, so nothing queued here is ever sent upstream by this module.
 
-Interactive work keeps reserved capacity and background work cannot be starved: background
-may never hold more than ``max_in_flight - interactive_reserve`` slots globally, nor more than
-``max_provider_in_flight - interactive_reserve`` slots on one provider, which leaves the
-reserve reachable for interactive work even while a full pool of background orders runs.
-Within one class the queue is FIFO, and interactive waiters are always considered before
-background ones.
+Fairness is bounded and provable rather than "interactive always first". Interactive work
+keeps reserved capacity (background may never hold more than
+``max_in_flight - interactive_reserve`` slots globally, nor more than
+``max_provider_in_flight - interactive_reserve`` on one provider), and on top of that the
+two classes alternate: once a class is served, the other class is offered the next free slot
+first. So while a background waiter is queued it can be overtaken by at most one interactive
+service, and a sustained interactive stream can no longer starve it. A caller-declared
+workload value is observation only and never reorders this.
+
+Observation is a side channel owned by the caller. This module only *forms* bounded facts
+inside its lock and hands them out afterwards through ``drain``; it performs no logging, IO
+or diagnostics call while holding the lock, and nothing it hands out can change an admission
+decision.
 """
 
 from __future__ import annotations
@@ -42,6 +50,13 @@ import uuid
 from collections import defaultdict
 
 LOG = logging.getLogger("tianshu_gateway")
+
+
+def _ignore(fact):
+    """The default fact sink: this module records nothing on its own."""
+    del fact
+    return None
+
 
 # The two deployment classes of this slice. They are local runtime policy, not part of any
 # published contract, and no protocol field, model name or header maps onto them.
@@ -86,6 +101,33 @@ class DuplicateRequest(AdmissionRefused):
         super().__init__(DUPLICATE, 400)
 
 
+class AdmissionFact:
+    """One bounded observation produced under the lock and emitted after it is released.
+
+    Plain data with no reference to a store, a connection or the ledger: the module that owns
+    the private tables decides how to record it.
+    """
+
+    __slots__ = ("service", "request_id", "workload_class", "outcome", "wait_ms")
+
+    def __init__(self, service, request_id, workload_class, outcome, wait_ms):
+        self.service = service
+        self.request_id = request_id
+        self.workload_class = workload_class
+        self.outcome = outcome
+        self.wait_ms = wait_ms
+
+    def as_row(self):
+        """The field names the private ledger uses, so the caller needs no knowledge of it."""
+        return {
+            "service": self.service,
+            "request_id": self.request_id,
+            "workload_class": self.workload_class,
+            "outcome": self.outcome,
+            "wait_ms": self.wait_ms,
+        }
+
+
 class Waiter:
     """One admitted-or-waiting request. Never a second source of capacity truth.
 
@@ -105,6 +147,7 @@ class Waiter:
         "globally_admitted",
         "outcome",
         "wait_ms",
+        "overtaken",
         "_clock",
         "_future",
         "_done",
@@ -121,6 +164,7 @@ class Waiter:
         self.globally_admitted = False
         self.outcome = None
         self.wait_ms = None
+        self.overtaken = 0
         self._clock = clock
         self._future = asyncio.get_running_loop().create_future()
         self._done = False
@@ -183,12 +227,11 @@ class BoundedAdmissionScheduler:
     *waits* instead of failing -- which is the point of a bounded queue.
     """
 
-    def __init__(self, policy, diagnostics=None, clock=time.monotonic):
+    def __init__(self, policy, clock=time.monotonic):
         policy.validate()
         if not callable(clock):
             raise ValueError("callable clock required")
         self.policy = policy
-        self.diagnostics = diagnostics
         self.clock = clock
         self.lock = asyncio.Lock()
         self._pending = {}
@@ -201,6 +244,13 @@ class BoundedAdmissionScheduler:
         self._background_provider_active = {}
         self._interactive_claimed = 0
         self._interactive_claimed_provider = {}
+        # Facts formed under the lock, emitted only after it is released.
+        self._facts = []
+        self._sink = _ignore
+        # Fairness state: the class that must be offered the next free slot first. It starts
+        # with interactive so an idle pool keeps interactive latency, and flips on every
+        # granted permit, which is what bounds how often one class can overtake the other.
+        self._preferred = INTERACTIVE
 
     # -- read-only inspection (verification and operator observation) -------------------
 
@@ -230,6 +280,18 @@ class BoundedAdmissionScheduler:
     def waiting_keys(self):
         return set(self._pending)
 
+    def waiting_overtakes(self, workload_class):
+        """How often queued work of one class was passed over for a granted permit.
+
+        Exposed so verification can assert the fairness bound instead of trusting the queue
+        order: while any background waiter is queued, the interactive allowance is one.
+        """
+        return sum(
+            waiter.overtaken
+            for queues in self._queues.values()
+            for waiter in queues[workload_class]
+        )
+
     def background_capacity(self):
         """Slots background work may use: the global limit minus the interactive reserve."""
         return self.policy.max_in_flight - self.policy.interactive_reserve
@@ -237,6 +299,21 @@ class BoundedAdmissionScheduler:
     def provider_background_capacity(self, limit=None):
         limit = self.policy.max_provider_in_flight if limit is None else limit
         return limit - self.policy.interactive_reserve
+
+    # -- observation port (side channel only) ------------------------------------------
+
+    def drain(self):
+        """Take the facts formed since the last call; the caller emits them outside the lock.
+
+        Nothing here can change an admission decision: the caller decides what to do with a
+        fact, and a caller that ignores, delays or fails on one cannot affect capacity.
+        """
+        facts, self._facts = self._facts, []
+        return facts
+
+    def _form(self, service, request_id, workload_class, outcome, wait_ms):
+        """Record one bounded fact. Called with the lock held and does no IO."""
+        self._facts.append(AdmissionFact(service, request_id, workload_class, outcome, wait_ms))
 
     # -- admission ----------------------------------------------------------------------
 
@@ -249,24 +326,50 @@ class BoundedAdmissionScheduler:
         is never taken from the client, so the provider limit this request waits for can never
         be retargeted while it waits.
         """
-        waiter = await self._enroll(
-            service, workload_class, declared_workload, key, provider_id, timeout_ms
-        )
-        await self._pump()
-        if waiter.done:
-            return waiter
-        return await self._wait(waiter, timeout_ms)
+        try:
+            waiter = await self._enroll(
+                service, workload_class, declared_workload, key, provider_id
+            )
+            await self._pump()
+            if waiter.done:
+                return waiter
+            return await self._wait(waiter, timeout_ms)
+        finally:
+            self.flush()
 
     async def release(self, waiter):
         """Free everything this waiter holds; the adapter guards against a second call."""
-        async with self.lock:
-            self._release_locked(waiter)
-            while self._pump_locked():
-                pass
+        try:
+            async with self.lock:
+                self._release_locked(waiter)
+                while self._pump_locked():
+                    pass
+        finally:
+            self.flush()
 
-    async def _enroll(
-        self, service, workload_class, declared_workload, key, provider_id, timeout_ms
-    ):
+    def flush(self):
+        """Emit formed facts outside the lock; a failing sink only degrades.
+
+        The sink receives the ledger's field names, so the caller can wire the private
+        recording call straight in without an adapter of its own.
+        """
+        for fact in self.drain():
+            try:
+                self._sink(**fact.as_row())
+            except Exception:
+                LOG.warning("admission_metric_degraded outcome=%s", fact.outcome)
+
+    def record(self, sink):
+        """Wire the narrow fact sink; it is called with no lock held.
+
+        The default sink does nothing, so a deployment that wires nothing keeps capacity
+        truthful and simply records no private admission row. A slow or failing sink can only
+        delay fact emission, never an admission decision or a forwarded byte.
+        """
+        self._sink = sink if callable(sink) else _ignore
+        return self
+
+    async def _enroll(self, service, workload_class, declared_workload, key, provider_id):
         if workload_class not in CLASSES:
             raise ValueError("invalid workload class")
         if not isinstance(provider_id, str) or not provider_id:
@@ -276,21 +379,16 @@ class BoundedAdmissionScheduler:
             if key in self._pending:
                 # One launch key may hold at most one permit; otherwise a repeated request
                 # could eventually hold two upstream slots for one logical call.
-                self._observe(service, key, workload_class, DUPLICATE, None)
+                self._form(service, key, workload_class, DUPLICATE, None)
                 raise DuplicateRequest()
             if self._waiting_locked() >= self.policy.max_queue_length:
-                self._observe(service, key, workload_class, QUEUE_FULL, None)
+                self._form(service, key, workload_class, QUEUE_FULL, None)
                 raise QueueFull()
             waiter = Waiter(
                 key, service, workload_class, declared_workload, provider_id, self.clock
             )
             self._pending[key] = waiter
             self._queues[service][workload_class].append(waiter)
-            if declared_workload is not None and declared_workload != workload_class:
-                # Observation only: a caller-declared workload never moves a caller between
-                # classes, it only tells the operator that the caller and the deployment
-                # binding disagree about what the request is doing.
-                LOG.info("declared_workload_differs_from_binding")
             return waiter
 
     async def _wait(self, waiter, timeout_ms):
@@ -299,27 +397,38 @@ class BoundedAdmissionScheduler:
         A cancelled wait is the client disconnect the gateway already handles, so it is never
         turned into a deadline here: the caller keeps its own cancellation semantics. Either
         way the waiter leaves the queue and its capacity, and nothing is sent.
+
+        The decision can land in the same event-loop step as the cancellation or the deadline,
+        after which the caller never reaches the permit at all. That permit is handed back
+        here, exactly once, so a lost consumer can never strand global or provider capacity.
         """
         try:
             await asyncio.wait_for(asyncio.shield(waiter.wait()), timeout_ms / 1000)
         except asyncio.TimeoutError:
-            await self._remove(waiter)
-            self._abandon(waiter, DEADLINE_EXCEEDED)
+            await self._discard(waiter, DEADLINE_EXCEEDED)
             raise TimeoutError() from None
         except asyncio.CancelledError:
             current = asyncio.current_task()
             cancelled = current is not None and current.cancelling()
-            await self._remove(waiter)
-            self._abandon(waiter, CANCELLED)
+            await self._discard(waiter, CANCELLED)
             if cancelled:
                 raise
         return waiter
 
-    async def _remove(self, waiter):
-        """Detach an undecided waiter from its queue; a held slot is freed by ``release``."""
+    async def _discard(self, waiter, outcome):
+        """Drop a waiter the caller can no longer take delivery from, and free any permit.
+
+        One path for every way a wait ends without a usable permit: an undecided waiter leaves
+        its queue, and a waiter that was granted in the same step hands the grant back. Both
+        cases free capacity at most once because the ledger move is idempotent.
+        """
         async with self.lock:
-            if not waiter.done:
-                self._detach_locked(waiter)
+            if waiter.done:
+                if waiter.outcome == ADMITTED:
+                    self._release_locked(waiter)
+                return
+            self._detach_locked(waiter)
+            self._abandon_locked(waiter, outcome)
 
     async def _pump(self):
         async with self.lock:
@@ -327,18 +436,43 @@ class BoundedAdmissionScheduler:
                 pass
 
     def _pump_locked(self):
+        """Grant as many permits as capacity allows, alternating between the two classes.
+
+        Each pass serves at most one waiter, in the class that must be offered the slot first,
+        and then flips that preference. Serving one interactive request can therefore never be
+        followed by another while background work is ready, which bounds how often a queued
+        background request is overtaken and removes the starvation a fixed interactive-first
+        order allows.
+        """
         served = False
-        for name in (INTERACTIVE, BACKGROUND):
-            # One queue per class, so a waiting background request can never sit in front of
-            # an interactive one, and interactive is always considered first.
-            for service, queues in self._queues.items():
-                for waiter in tuple(queues[name]):
-                    if not self._can_serve_locked(waiter):
-                        continue
-                    self._serve_locked(waiter)
-                    served = True
+        while True:
+            order = (self._preferred, BACKGROUND if self._preferred == INTERACTIVE else INTERACTIVE)
+            chosen = None
+            for name in order:
+                chosen = self._next_ready_locked(name)
+                if chosen is not None:
                     break
-        return served
+            if chosen is None:
+                return served
+            self._serve_locked(chosen)
+            served = True
+
+    def _next_ready_locked(self, name):
+        """The oldest ready waiter of one class, or None; also counts what it passed over."""
+        for service, queues in self._queues.items():
+            for waiter in queues[name]:
+                if not self._can_serve_locked(waiter):
+                    continue
+                # Only work that was ready and got passed over is counted, so the counter
+                # measures overtaking rather than ordinary queue depth.
+                for other in CLASSES:
+                    if other == name:
+                        continue
+                    for skipped in self._queues[service][other]:
+                        if skipped is not waiter and self._can_serve_locked(skipped):
+                            skipped.overtaken += 1
+                return waiter
+        return None
 
     def _can_serve_locked(self, waiter):
         """Two hard limits, in the order that makes the reserve meaningful.
@@ -351,10 +485,6 @@ class BoundedAdmissionScheduler:
         """
         if waiter.done:
             return False
-        if self._inflight >= self.policy.max_in_flight:
-            return False
-        if self._provider_active.get(waiter.provider_id, 0) >= self.policy.max_provider_in_flight:
-            return False
         if waiter.workload_class == BACKGROUND:
             if self._background_active >= self.background_capacity():
                 return False
@@ -363,7 +493,12 @@ class BoundedAdmissionScheduler:
                 >= self.provider_background_capacity()
             ):
                 return False
-        return True
+        return self._has_capacity_locked(waiter.provider_id)
+
+    def _has_capacity_locked(self, provider_id):
+        if self._inflight >= self.policy.max_in_flight:
+            return False
+        return self._provider_active.get(provider_id, 0) < self.policy.max_provider_in_flight
 
     def _serve_locked(self, waiter):
         """Grant the global and provider slots together: only a full permit is admitted."""
@@ -382,8 +517,9 @@ class BoundedAdmissionScheduler:
             self._interactive_claimed_provider[provider] = (
                 self._interactive_claimed_provider.get(provider, 0) + 1
             )
+        self._preferred = BACKGROUND if waiter.workload_class == INTERACTIVE else INTERACTIVE
         self._detach_locked(waiter)
-        self._observe(
+        self._form(
             waiter.service,
             waiter.key,
             waiter.workload_class,
@@ -400,6 +536,11 @@ class BoundedAdmissionScheduler:
             for queue in queues.values():
                 if waiter in queue:
                     queue.remove(waiter)
+
+    def _abandon_locked(self, waiter, outcome):
+        if not waiter._abandon(outcome):
+            return
+        self._form(waiter.service, waiter.key, waiter.workload_class, outcome, None)
 
     def _release_locked(self, waiter):
         if waiter.globally_admitted:
@@ -427,32 +568,8 @@ class BoundedAdmissionScheduler:
         else:
             del ledger[provider]
 
-    def _abandon(self, waiter, outcome):
-        if not waiter._abandon(outcome):
-            return
-        self._observe(waiter.service, waiter.key, waiter.workload_class, outcome, None)
-
     def _waiting_locked(self):
         return sum(len(queue) for queues in self._queues.values() for queue in queues.values())
-
-    def _observe(self, service, request_id, workload_class, outcome, wait_ms):
-        """Hand one bounded fact to the injected diagnostics port; failures only degrade.
-
-        Diagnostics is a side channel: this never raises, never retries, and never influences
-        the admission decision that follows or precedes it.
-        """
-        if self.diagnostics is None:
-            return
-        try:
-            self.diagnostics.record_admission(
-                service=service,
-                request_id=request_id,
-                workload_class=workload_class,
-                outcome=outcome,
-                wait_ms=wait_ms,
-            )
-        except Exception:
-            LOG.warning("admission_metric_degraded outcome=%s", outcome)
 
 
 def bind(scheduler, service, workload_class, declared_workload, provider_id, key=None):
