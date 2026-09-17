@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -251,6 +251,15 @@ class SchedulerCoreTests(unittest.IsolatedAsyncioTestCase):
 
         async def poll():
             while self.scheduler.waiting_keys() != set(keys):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(poll(), 2)
+
+    async def waiting_until(self, *keys):
+        """Wait until at least these keys are queued, for cases where the queue keeps others."""
+
+        async def poll():
+            while not set(keys) <= self.scheduler.waiting_keys():
                 await asyncio.sleep(0)
 
         await asyncio.wait_for(poll(), 2)
@@ -636,6 +645,108 @@ class SchedulerCoreTests(unittest.IsolatedAsyncioTestCase):
         # honoured while the sink was busy.
         self.assertEqual(self.observed.calls, 2)
 
+    async def test_a_reclaimed_grant_is_offered_to_the_next_waiter(self):
+        # The successor case: a slot freed by cleanup -- not by a completed attempt -- is still
+        # free capacity, so whoever is already waiting must be admitted without waiting for an
+        # unrelated request to finish or for a later request to trigger the queue.
+        self.build(max_in_flight=2, max_provider_in_flight=2, interactive_reserve=0)
+        held = [
+            await self.permit("companion", INTERACTIVE, f"i-{n}", "provider-a") for n in range(2)
+        ]
+        waiting = self.acquiring("companion", INTERACTIVE, "c-queued")
+        successor = self.acquiring("companion", INTERACTIVE, "d-successor")
+        await self.enrolled("c-queued", "d-successor")
+        # The plain release path admits the queue head.
+        await self.scheduler.release(held.pop(0))
+        await self.enrolled("d-successor")
+        self.assertEqual(self.scheduler.waiting, 1)
+        # The queue head is now admitted but not delivered yet; cancelling it must hand the slot
+        # straight to the successor, with nothing else released and nothing else enqueued.
+        waiting.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiting
+        await self.settle()
+        self.assertTrue(successor.done(), "successor was never admitted despite a free slot")
+        admitted = await successor
+        self.assertTrue(admitted.live())
+        self.assertEqual(self.scheduler.waiting, 0)
+        self.assertEqual(self.scheduler.inflight, 2)
+        self.assertEqual(self.scheduler.provider_active, {"provider-a": 2})
+        self.assertLessEqual(self.scheduler.background_claimed, 0)
+        # No deadlock and no leak once everything is done: the pool is reusable from scratch.
+        await self.scheduler.release(held.pop(0))
+        await self.scheduler.release(admitted)
+        await self.wait_idle()
+        again = await self.permit("companion", INTERACTIVE, "after", "provider-a")
+        self.assertTrue(again.live())
+        await self.scheduler.release(again)
+        await self.wait_idle()
+
+    async def test_a_deadline_that_takes_the_grant_also_advances_the_queue(self):
+        # The same cleanup gap reached through the deadline: a grant the consumer never receives
+        # must not leave the next waiter stranded with an idle slot.
+        self.build(max_in_flight=2, max_provider_in_flight=2, interactive_reserve=0)
+        first = await self.permit("companion", INTERACTIVE, "i-1", "provider-a")
+        second = await self.permit("companion", INTERACTIVE, "i-2", "provider-a")
+        # The head of the queue is the one whose deadline is about to fire; the successor behind
+        # it has room to wait, so only the cleanup path can hand it the reclaimed slot.
+        expiring = self.acquiring("companion", INTERACTIVE, "b-expiring", timeout_ms=30)
+        successor = self.acquiring("companion", INTERACTIVE, "c-successor", timeout_ms=600)
+        await self.waiting_for("b-expiring", "c-successor")
+        # The deadline fires while the pool is still busy, so the head leaves the queue with no
+        # grant at all -- an ordinary refusal that must not disturb the successor.
+        await asyncio.sleep(0.05)
+        with self.assertRaises((TimeoutError, asyncio.CancelledError)):
+            await expiring
+        self.assertEqual(self.scheduler.waiting_keys(), {"c-successor"})
+        # The slot the deadline did not take is still handed to the successor by the release.
+        await self.scheduler.release(first)
+        await self.settle()
+        self.assertTrue(successor.done(), "successor was never admitted after a deadline refusal")
+        admitted = await successor
+        self.assertTrue(admitted.live())
+        self.assertEqual(self.scheduler.inflight, 2)
+        await self.scheduler.release(second)
+        await self.scheduler.release(admitted)
+        await self.wait_idle()
+
+    async def test_cleanup_never_over_admits_beyond_the_hard_limits(self):
+        # The reclaim-and-advance path must respect the same two limits as any other release:
+        # no global, provider or background over-admission while cleanup hands slots on.
+        self.build(max_in_flight=3, max_provider_in_flight=2, interactive_reserve=1)
+        held = [
+            await self.permit("companion", INTERACTIVE, "i-1", "provider-a"),
+            await self.permit("companion", INTERACTIVE, "i-2", "provider-a"),
+            await self.permit("memory-index", BACKGROUND, "b-1", "provider-b"),
+        ]
+        self.assertEqual(self.scheduler.inflight, 3)
+        queued = [
+            self.acquiring("companion", INTERACTIVE, "i-queued", "provider-b"),
+            self.acquiring("memory-index", BACKGROUND, "b-queued", "provider-a"),
+        ]
+        await self.enrolled("i-queued", "b-queued")
+        # Nothing may be admitted: both providers are at their per-provider limit.
+        await self.settle()
+        self.assertEqual(self.scheduler.waiting, 2)
+        self.assertEqual(self.scheduler.provider_active, {"provider-a": 2, "provider-b": 1})
+        # A cancellation that reclaims nothing and a cancellation that reclaims one slot both
+        # keep the ledgers inside their limits.
+        queued[0].cancel()
+        queued[1].cancel()
+        for task in queued:
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        await self.settle()
+        self.assertLessEqual(self.scheduler.inflight, 3)
+        self.assertLessEqual(
+            self.scheduler.background_claimed, self.scheduler.background_capacity()
+        )
+        for provider, count in self.scheduler.provider_active.items():
+            self.assertLessEqual(count, 2, provider)
+        for waiter in held:
+            await self.scheduler.release(waiter)
+        await self.wait_idle()
+
     async def test_refusals_are_recorded_as_bounded_private_facts(self):
         self.build(max_in_flight=3, max_provider_in_flight=3, max_queue_length=1)
         first = await self.permit("companion", INTERACTIVE, "i-1", "provider-a")
@@ -997,6 +1108,60 @@ class ScheduledScenarios:
                 self.assertEqual(finished.status, 200)
         self.assertEqual(self.services.call_count(), self.global_limit)
 
+    async def test_a_queue_head_that_gives_up_hands_its_slot_to_the_successor(self):
+        # End to end through the adapter, in the reviewer's configuration: every slot is taken,
+        # one slot is handed back, and the queued caller that receives that grant is gone in the
+        # same event-loop step. The unused grant has to reach the request behind it at once,
+        # because nothing else will release that slot again.
+        self.services.mode = "hold"
+        # A short admission deadline, so a slot stranded in the abandoned grant shows up for the
+        # successor as a refusal. Every holder below is released well inside that window.
+        self.scheduler.policy = replace(self.scheduler.policy, wait_timeout_ms=400)
+        held = [asyncio.create_task(self.chat(self.chat_headers("memory-index"))) for _ in range(2)]
+        await self.services.wait_calls(2)
+        # Filling the last slot through the scheduler's own port keeps the release below exact:
+        # one permit comes back, and the queue head is the request waiting for it.
+        blocker = await self.scheduler.acquire(
+            "companion", INTERACTIVE, None, "blocker", "provider-a", 5000
+        )
+        self.assertEqual(self.scheduler.inflight, self.global_limit)
+        # The head of the queue is an HTTP request, so the abandoned grant is cancelled through
+        # the same adapter a disconnected client goes through; the successor behind it is the
+        # request that must inherit the slot.
+        giving_up = asyncio.create_task(
+            self.chat(self.chat_headers("companion", request_id="head-gives-up"))
+        )
+        await self.wait_for(lambda: self.scheduler.waiting == 1)
+        successor = asyncio.create_task(
+            self.chat(self.chat_headers("companion", request_id="successor-forwarded"))
+        )
+        await self.wait_for(lambda: self.scheduler.waiting == 2)
+        before = self.services.call_count()
+        # Both calls land in the same step: the queued caller is granted the slot the release
+        # frees, and gives up before it can ever use it.
+        await self.scheduler.release(blocker)
+        giving_up.cancel()
+        await self.wait_for(lambda: self.services.call_count() == before + 1)
+        # The successor was forwarded on the inherited slot, with nothing else released: had the
+        # abandoned grant been stranded, this successor would have spent its deadline in the
+        # queue and never reached the upstream at all. One reclaimed permit, one live successor:
+        # the pool stands at its limit and the queue is empty.
+        self.assertEqual(self.scheduler.waiting, 0)
+        self.assertEqual(self.scheduler.inflight, self.global_limit)
+        await self.outcome(giving_up)
+        self.assertEqual(self.scheduler.inflight, self.global_limit)
+        # The inherited slot is live, so the pool drains through the fixture.
+        self.scheduler.policy = replace(self.scheduler.policy, wait_timeout_ms=5000)
+        await self.release_held(held)
+        await self.outcome(successor)
+        for task in held:
+            await self.outcome(task)
+        self.assertEqual(self.services.call_count(), before + 1)
+        self.assertEqual(self.scheduler.inflight, 0)
+        self.assertEqual(self.scheduler.provider_active, {})
+        self.assertEqual(self.scheduler.waiting, 0)
+        await self.wait_for(lambda: self.gateway.idle)
+
     async def test_client_cancel_while_queued_is_removed_and_not_forwarded(self):
         self.services.mode = "hold"
         held = [asyncio.create_task(self.chat(self.chat_headers("memory-index"))) for _ in range(2)]
@@ -1222,6 +1387,18 @@ class ScheduledScenarios:
         self.assertEqual(self.scheduler.waiting, 0)
         await self.wait_for(lambda: self.gateway.idle)
 
+    @staticmethod
+    async def outcome(task):
+        """Await a client task that may have been cancelled, without failing the case.
+
+        A cancelled request is the condition under test, so its own transport error is not a
+        result to assert -- it is caught here so it cannot surface as a teardown failure.
+        """
+        try:
+            return await task
+        except BaseException as exc:  # noqa: BLE001 - a cancelled client is an expected outcome
+            return exc
+
     async def test_duplicate_request_id_never_holds_two_permits(self):
         self.services.mode = "hold"
         held = [asyncio.create_task(self.chat(self.chat_headers("memory-index"))) for _ in range(2)]
@@ -1296,9 +1473,13 @@ class ScheduledScenarios:
             self.assertEqual(response.status, 200)
             request_id = response.headers["X-Request-ID"]
         self.assertEqual(self.services.call_count(), 3)
-        self.assertEqual(
-            self.gateway.diagnostics.admission("external", request_id), (INTERACTIVE, ADMITTED, 0)
-        )
+        # The class and the outcome are the contract; the wait of an immediately admitted request
+        # comes from the real clock, so it is bounded rather than pinned to one exact value.
+        recorded = self.gateway.diagnostics.admission("external", request_id)
+        self.assertIsNotNone(recorded)
+        observed_class, outcome, wait_ms = recorded
+        self.assertEqual((observed_class, outcome), (INTERACTIVE, ADMITTED))
+        self.assertLess(wait_ms, 100)
         for task in background:
             async with await task as finished:
                 self.assertEqual(finished.status, 200)

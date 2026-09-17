@@ -341,9 +341,8 @@ class BoundedAdmissionScheduler:
         """Free everything this waiter holds; the adapter guards against a second call."""
         try:
             async with self.lock:
-                self._release_locked(waiter)
-                while self._pump_locked():
-                    pass
+                if self._release_locked(waiter):
+                    self._advance_locked()
         finally:
             self.flush()
 
@@ -416,24 +415,52 @@ class BoundedAdmissionScheduler:
         return waiter
 
     async def _discard(self, waiter, outcome):
-        """Drop a waiter the caller can no longer take delivery from, and free any permit.
+        """Drop a waiter the caller can no longer take delivery from, then advance the queue.
 
         One path for every way a wait ends without a usable permit: an undecided waiter leaves
         its queue, and a waiter that was granted in the same step hands the grant back. Both
-        cases free capacity at most once because the ledger move is idempotent.
+        cases free capacity at most once because the ledger move is idempotent, and both must
+        advance the queue: the slot this waiter did not use -- whether it was reclaimed from a
+        grant or simply never taken -- is available to whoever is already waiting. A successor
+        may therefore never be left until its own deadline merely because the release it was
+        waiting for came from a cleanup instead of from a completed attempt.
         """
         async with self.lock:
             if waiter.done:
-                if waiter.outcome == ADMITTED:
-                    self._release_locked(waiter)
-                return
-            self._detach_locked(waiter)
-            self._abandon_locked(waiter, outcome)
+                self._reclaim_locked(waiter)
+            else:
+                self._detach_locked(waiter)
+                self._abandon_locked(waiter, outcome)
+            if self._has_free_capacity_locked():
+                self._advance_locked()
+
+    def _has_free_capacity_locked(self):
+        """Whether some waiting request could be served right now, on the global limit alone.
+
+        Cheap and conservative on purpose: it decides whether advancing is worth a pass, while
+        the per-provider and background limits stay where they belong, inside ``_can_serve``.
+        """
+        return self._waiting_locked() > 0 and self._inflight < self.policy.max_in_flight
+
+    def _reclaim_locked(self, waiter):
+        """Hand back everything a waiter holds, if it holds anything, exactly once.
+
+        Returns whether capacity was actually freed -- the condition for advancing the queue.
+        Every caller that can free capacity goes through here, which is what keeps the release
+        and wake-up paths from drifting apart.
+        """
+        if not waiter.done or waiter.outcome != ADMITTED:
+            return False
+        return self._release_locked(waiter)
+
+    def _advance_locked(self):
+        """Grant every permit the freed capacity allows. Called with the lock held."""
+        while self._pump_locked():
+            pass
 
     async def _pump(self):
         async with self.lock:
-            while self._pump_locked():
-                pass
+            self._advance_locked()
 
     def _pump_locked(self):
         """Grant as many permits as capacity allows, alternating between the two classes.
@@ -527,8 +554,11 @@ class BoundedAdmissionScheduler:
             max(0, int((self.clock() - waiter.queued_at) * 1000)),
         )
         if not waiter._settle(ADMITTED):
-            # The consumer gave up in the same step; its capacity is not left behind.
-            self._release_locked(waiter)
+            # The consumer gave up in the same step; its capacity is not left behind, and the
+            # slot it briefly held is offered to whoever is already waiting -- the grant loop
+            # that called this method may have no further pass left.
+            if self._reclaim_locked(waiter):
+                self._advance_locked()
 
     def _detach_locked(self, waiter):
         self._pending.pop(waiter.key, None)
@@ -543,8 +573,16 @@ class BoundedAdmissionScheduler:
         self._form(waiter.service, waiter.key, waiter.workload_class, outcome, None)
 
     def _release_locked(self, waiter):
+        """Give back this waiter's slots. Returns whether it freed anything at all.
+
+        The return value is the single wake-up condition: only a call that really moved a
+        ledger can make room for a waiting request, so a repeated or empty release neither
+        changes capacity nor advances the queue.
+        """
+        freed = False
         if waiter.globally_admitted:
             waiter.globally_admitted = False
+            freed = True
             self._inflight -= 1
             if waiter.workload_class == INTERACTIVE:
                 self._interactive_claimed -= 1
@@ -552,8 +590,9 @@ class BoundedAdmissionScheduler:
                 self._background_active -= 1
         provider = waiter.released_provider
         if provider is None:
-            return
+            return freed
         waiter.released_provider = None
+        freed = True
         self._provider_active[provider] -= 1
         if not self._provider_active[provider]:
             del self._provider_active[provider]
@@ -567,6 +606,7 @@ class BoundedAdmissionScheduler:
             ledger[provider] = claimed
         else:
             del ledger[provider]
+        return freed
 
     def _waiting_locked(self):
         return sum(len(queue) for queues in self._queues.values() for queue in queues.values())
