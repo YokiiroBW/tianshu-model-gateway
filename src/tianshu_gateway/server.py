@@ -1262,23 +1262,27 @@ async def errors(request, handler):
         return error_response(
             Rejected("dependency_unavailable", 503), request[REQUEST_ID], contract
         )
+    else:
+        # A route that answered without raising and without forwarding anything ends here: the
+        # receipt read, the usage report and every other non-forwarding success. The terminal
+        # record belongs to *this* request's correlation, so it is written inside the bound
+        # context and before the context is released by the finally block below. A forwarded
+        # attempt already recorded its own terminal in the transfer path.
+        if not probe and gateway is not None:
+            if response.status >= 400:
+                gateway.record_event(
+                    request,
+                    "request.rejected",
+                    error_code=HTTP_STATUS_CODES.get(
+                        response.status, observation_events.UNKNOWN_ERROR_CODE
+                    ),
+                )
+            else:
+                gateway.record_event(request, "request.finished", outcome="succeeded")
+        return response
     finally:
         if token is not None:
             reset_correlation(token)
-    if not probe and gateway is not None:
-        # A route that answered without raising and without forwarding anything ends here.
-        # A forwarded attempt already recorded its own terminal in the transfer path.
-        if response.status >= 400:
-            gateway.record_event(
-                request,
-                "request.rejected",
-                error_code=HTTP_STATUS_CODES.get(
-                    response.status, observation_events.UNKNOWN_ERROR_CODE
-                ),
-            )
-        else:
-            gateway.record_event(request, "request.finished", outcome="succeeded")
-    return response
 
 
 def observed(handler):

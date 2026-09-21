@@ -296,6 +296,7 @@ class HealthRouteTests(ObservedTestCase, unittest.IsolatedAsyncioTestCase):
             await response.read()
 
     async def test_probing_readiness_writes_nothing_at_all(self):
+        await self.harness.settle()
         before = self.harness.corpus()
         names_before = [record["event"] for record in self.harness.records()]
         for _ in range(5):

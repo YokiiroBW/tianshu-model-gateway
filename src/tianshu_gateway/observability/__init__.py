@@ -153,6 +153,10 @@ class Observability:
         self.model_observation.forget()
         await self.log.shutdown(timeout)
 
+    async def flush(self):
+        """Wait until every event submitted before this call is on durable storage."""
+        return await self.log.flush()
+
     def close_sync(self):
         self._closed = True
         self.log.close_sync()

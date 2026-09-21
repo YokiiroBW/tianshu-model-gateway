@@ -5,12 +5,16 @@ ledger, in-process platform and upstream doubles on loopback, and no network egr
 this module touches a NAS, a production container, a real account or a paid model call.
 """
 
+import asyncio
+import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -1127,6 +1131,7 @@ class ProbeIsolationTests(ObservedTestCase, unittest.IsolatedAsyncioTestCase):
         await self.observe()
 
     async def test_a_probe_writes_no_record_and_changes_no_state(self):
+        await self.harness.settle()
         before = self.harness.corpus()
         names_before = [record["event"] for record in self.harness.records()]
         for path in ("/health/live", "/health/live", "/health/ready", "/health/ready"):
@@ -1168,6 +1173,595 @@ class ProbeIsolationTests(ObservedTestCase, unittest.IsolatedAsyncioTestCase):
             )
             await response.read()
         self.assertEqual(self.harness.services.config_calls, [])
+
+
+class _SlowHandle:
+    """A real segment handle with exactly one deliberately slow operation.
+
+    The tests that prove "no disk operation runs on the event loop" need a genuinely slow disk,
+    not a mocked one: every operation still reaches the real file, it just takes measurable
+    time. Only the named operation is delayed, so the measurement is attributable.
+    """
+
+    def __init__(self, handle, slow, delay):
+        self.handle = handle
+        self.slow = slow
+        self.delay = delay
+
+    def __getattr__(self, name):
+        return getattr(self.handle, name)
+
+    def _pause(self, name):
+        if self.slow == name:
+            time.sleep(self.delay)
+
+    def write(self, data):
+        self._pause("write")
+        return self.handle.write(data)
+
+    def flush(self):
+        self._pause("flush")
+        return self.handle.flush()
+
+    def close(self):
+        self._pause("close")
+        return self.handle.close()
+
+
+def _slow_fsync(delay):
+    real = sink.os.fsync
+
+    def fsync(fd):
+        time.sleep(delay)
+        return real(fd)
+
+    return fsync
+
+
+def _stuck_fsync(release):
+    real = sink.os.fsync
+
+    def fsync(fd):
+        release.wait(30.0)
+        return real(fd)
+
+    return fsync
+
+
+class SinkTestCase(unittest.TestCase):
+    """A raw sink on a temporary directory, with no server and no event loop around it."""
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="ts103-sink-"))
+        self.addCleanup(shutil.rmtree, self.temp, ignore_errors=True)
+        self.stderr = io.StringIO()
+
+    def build(self, **overrides):
+        options = {"stderr": self.stderr}
+        options.update(overrides)
+        return sink.RuntimeLog(self.temp, **options)
+
+    def stored(self):
+        return sum(path.stat().st_size for path in sink.segment_paths(self.temp))
+
+    def fill(self, log, room):
+        """Make the current segment and the whole directory exactly ``room`` bytes big.
+
+        A truncated file is a sparse file, so the real 64 MiB and 32 MiB thresholds below cost
+        no disk. The handle is left at the end so the next append really appends.
+        """
+        log._handle.truncate(room)
+        log._handle.seek(0, os.SEEK_END)
+        log._directory_bytes = room
+        log._segment_bytes = room
+
+
+class SlowDiskTests(SinkTestCase, unittest.IsolatedAsyncioTestCase):
+    """R1: the durable writer owns the disk, so a slow disk cannot stall the event loop.
+
+    The reproduction injected 250 ms into ``fsync`` and measured a 20 ms heartbeat taking
+    250 ms. Every operation the writer performs is now measured the same way: the write must
+    still wait for the real acknowledgement, and the loop must keep its own cadence while it
+    waits.
+    """
+
+    async def heartbeat(self, ticks):
+        while True:
+            mark = time.monotonic()
+            await asyncio.sleep(0.02)
+            ticks.append(time.monotonic() - mark)
+
+    async def ticker(self):
+        ticks = []
+        task = asyncio.create_task(self.heartbeat(ticks))
+        self.addCleanup(task.cancel)
+        return ticks, task
+
+    async def test_no_slow_disk_operation_delays_the_loop(self):
+        for slow in ("write", "flush", "fsync"):
+            with self.subTest(slow=slow):
+                directory = self.temp / slow
+                log = sink.RuntimeLog(directory, stderr=self.stderr).open()
+                await log.start()
+                self.addCleanup(log.close_sync)
+                ticks, task = await self.ticker()
+                if slow == "fsync":
+                    context = patch.object(sink.os, "fsync", _slow_fsync(0.25))
+                else:
+                    log._handle = _SlowHandle(log._handle, slow, 0.25)
+                    context = contextlib.nullcontext()
+                with context:
+                    mark = time.monotonic()
+                    self.assertTrue(await log.submit_durable("runtime.starting"))
+                    waited = time.monotonic() - mark
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                # The acknowledgement really waited for the slow operation...
+                self.assertGreaterEqual(waited, 0.25)
+                # ...and the loop kept ticking at its own 20 ms cadence throughout.
+                self.assertTrue(ticks, "the heartbeat never ran")
+                self.assertLess(max(ticks), 0.15)
+                await log.shutdown()
+
+    async def test_the_durable_answer_comes_only_after_the_record_is_on_disk(self):
+        log = self.build().open()
+        await log.start()
+        self.addCleanup(log.close_sync)
+        with patch.object(sink.os, "fsync", _slow_fsync(0.25)):
+            mark = time.monotonic()
+            self.assertTrue(await log.submit_durable("runtime.starting"))
+            waited = time.monotonic() - mark
+        self.assertGreaterEqual(waited, 0.25)
+        stored = read_log(self.temp)
+        self.assertEqual([record["event"] for record in stored], ["runtime.starting"])
+        await log.shutdown()
+
+    async def test_a_slow_close_does_not_delay_the_loop_during_shutdown(self):
+        log = self.build().open()
+        await log.start()
+        real = log._handle
+        log._handle = _SlowHandle(real, "close", 0.25)
+        ticks, task = await self.ticker()
+        mark = time.monotonic()
+        await log.shutdown()
+        elapsed = time.monotonic() - mark
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        self.assertGreaterEqual(elapsed, 0.25)
+        self.assertLess(max(ticks), 0.15)
+        # The owner thread closed its own handle: no second writer ever touched it.
+        self.assertTrue(real.closed)
+
+    async def test_a_stuck_disk_cannot_hold_shutdown_open_and_never_replays_the_write(self):
+        log = self.build().open()
+        await log.start()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with patch.object(sink.os, "fsync", _stuck_fsync(release)):
+            waiter = asyncio.create_task(log.submit_durable("runtime.starting"))
+            await asyncio.sleep(0.05)
+            mark = time.monotonic()
+            await log.shutdown(0.2)
+            elapsed = time.monotonic() - mark
+            # A write that has not returned is not a failed write: the caller is refused, and
+            # the sink never claims a durability it could not prove.
+            self.assertFalse(await waiter)
+        self.assertLess(elapsed, 1.0)
+        self.assertFalse(log.accepts_new_work())
+        release.set()
+        for _ in range(400):
+            if not log.stats()["writer_alive"]:
+                break
+            await asyncio.sleep(0.01)
+        self.assertFalse(log.stats()["writer_alive"], "the owner thread never finished")
+        # The record is written at most once: a timeout never resends a model call or a message.
+        lines = [record for record in read_log(self.temp) if record["event"] == "runtime.starting"]
+        self.assertLessEqual(len(lines), 1)
+
+    async def test_a_cancelled_wait_does_not_duplicate_or_lose_the_record(self):
+        log = self.build().open()
+        await log.start()
+        self.addCleanup(log.close_sync)
+        with patch.object(sink.os, "fsync", _slow_fsync(0.25)):
+            waiter = asyncio.create_task(log.submit_durable("runtime.starting"))
+            await asyncio.sleep(0.05)
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+        await log.flush()
+        names = [record["event"] for record in read_log(self.temp)]
+        self.assertEqual(names.count("runtime.starting"), 1)
+        # The sink is still usable and the next record is durable: cancelling a waiter is not a
+        # failure of the sink.
+        self.assertTrue(await log.submit_durable("runtime.started"))
+        await log.shutdown()
+
+    async def test_the_hand_off_stays_bounded_and_never_blocks_the_submitter(self):
+        log = self.build().open()
+        await log.start()
+        self.addCleanup(log.close_sync)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with patch.object(sink.os, "fsync", _stuck_fsync(release)):
+            await asyncio.sleep(0)
+            marks = []
+            for _ in range(sink.QUEUE_ENTRIES + sink.BATCH_LIMIT + 200):
+                mark = time.monotonic()
+                log.submit("runtime.starting")
+                marks.append(time.monotonic() - mark)
+            # A full hand-off refuses the new record instead of evicting, blocking or growing.
+            self.assertLess(max(marks), 0.05)
+            self.assertGreater(log.stats()["overflowed"], 0)
+            self.assertFalse(log.accepts_new_work())
+            self.assertLessEqual(log.stats()["queued"], sink.QUEUE_ENTRIES)
+        release.set()
+
+
+class SlowDiskLivenessTests(ObservedTestCase, unittest.IsolatedAsyncioTestCase):
+    """R1 through the real HTTP surface: a stuck disk delays one attempt, nothing else."""
+
+    async def asyncSetUp(self):
+        await self.observe()
+
+    async def test_liveness_still_answers_while_a_durable_write_is_waiting(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with patch.object(sink.os, "fsync", _stuck_fsync(release)):
+            waiter = asyncio.create_task(
+                self.harness.observability.durable_event("upstream.call_started")
+            )
+            await asyncio.sleep(0.05)
+            mark = time.monotonic()
+            async with await self.client.get(self.harness.url + "/health/live") as response:
+                self.assertEqual(response.status, 200)
+                await response.json()
+            elapsed = time.monotonic() - mark
+            self.assertLess(elapsed, 1.0)
+            # The attempt itself is still waiting for its real acknowledgement.
+            self.assertFalse(waiter.done())
+        release.set()
+        self.assertTrue(await waiter)
+
+
+class UnifiedBudgetTests(SinkTestCase):
+    """R2: seal, recovery and maintenance bytes are reserved exactly like a business record.
+
+    The reproduction measured a 64 MiB rotation over budget by 326 bytes and a 32 MiB recovery
+    over budget by 322 bytes, with the sink still accepting new work. Both thresholds are real
+    constants, so both are exercised at their real size -- as sparse files, which cost no disk.
+    """
+
+    def test_a_seal_at_the_segment_boundary_writes_nothing_at_all(self):
+        log = self.build(max_directory_bytes=sink.SEGMENT_BYTES).open()
+        self.addCleanup(log.close_sync)
+        self.fill(log, sink.SEGMENT_BYTES - 1)
+        line = events.encode_record(log.record("runtime.starting"))
+        self.assertFalse(log._write(line))
+        # Not one byte past the budget, and the sink says so instead of quietly overrunning it.
+        self.assertEqual(self.stored(), sink.SEGMENT_BYTES - 1)
+        self.assertEqual(log.state, sink.STATE_UNAVAILABLE)
+        self.assertEqual(log.reason, sink.REASON_CAPACITY)
+        self.assertFalse(log.accepts_new_work())
+
+    def test_a_recovery_record_at_the_directory_boundary_writes_nothing_at_all(self):
+        log = self.build(max_directory_bytes=sink.MIN_DIRECTORY_BYTES).open()
+        self.addCleanup(log.close_sync)
+        line = events.encode_record(log.record("runtime.starting"))
+        room = sink.MIN_DIRECTORY_BYTES - len(line)
+        self.fill(log, room)
+        log._degrade(sink.REASON_IO)
+        # The line itself would fit; the recovery record that must follow it does not, so the
+        # pair is refused as a whole rather than half-written.
+        self.assertFalse(log._write(line))
+        self.assertEqual(self.stored(), room)
+        self.assertEqual(log.state, sink.STATE_UNAVAILABLE)
+        self.assertFalse(log.accepts_new_work())
+
+    def test_a_seal_and_its_record_are_reserved_together(self):
+        # The same arithmetic at a shrinkable equivalent boundary: the real thresholds are
+        # covered above, and this one can be measured byte by byte.
+        with patch.object(sink, "SEGMENT_BYTES", 2048):
+            log = self.build(max_directory_bytes=4096).open()
+            self.addCleanup(log.close_sync)
+            line = events.encode_record(log.record("runtime.starting"))
+            seal = log.identity.measure("log.segment_sealed")
+            # Room for the line, deliberately not for the line plus the seal record.
+            room = 4096 - seal - len(line) + 1
+            self.fill(log, room)
+            self.assertFalse(log._write(line))
+            self.assertEqual(self.stored(), room)
+            self.assertEqual(log.reason, sink.REASON_CAPACITY)
+
+    def test_a_seal_that_fits_is_written_with_its_record(self):
+        with patch.object(sink, "SEGMENT_BYTES", 2048):
+            log = self.build(max_directory_bytes=4096).open()
+            self.addCleanup(log.close_sync)
+            line = events.encode_record(log.record("runtime.starting"))
+            seal = log.identity.measure("log.segment_sealed")
+            room = 4096 - seal - len(line)
+            self.fill(log, room)
+            self.assertTrue(log._write(line))
+            self.assertTrue(log._sync())
+            # Only the new segment is read: the filled one holds the zeros that made it full, and
+            # those are not records.
+            with open(sink.segment_paths(self.temp)[-1], "rb") as handle:
+                names = [events.decode_line(raw)["event"] for raw in handle if raw.strip()]
+            self.assertIn("log.segment_sealed", names)
+            self.assertIn("runtime.starting", names)
+            self.assertLessEqual(self.stored(), 4096)
+            self.assertEqual(len(sink.segment_paths(self.temp)), 2)
+
+    def test_a_rotation_while_degraded_reserves_its_recovery_record_too(self):
+        with patch.object(sink, "SEGMENT_BYTES", 2048):
+            log = self.build(max_directory_bytes=4096).open()
+            self.addCleanup(log.close_sync)
+            log._degrade(sink.REASON_IO)
+            line = events.encode_record(log.record("runtime.starting"))
+            seal = log.identity.measure("log.segment_sealed")
+            recovered = log.identity.measure("log.recovered")
+            # Room for the seal and the line, deliberately not for the recovery record that has
+            # to follow them while the sink is degraded: the whole triple is refused, so the
+            # budget holds even on the path that used to bypass it.
+            room = 4096 - seal - len(line) - recovered + 1
+            self.fill(log, room)
+            self.assertFalse(log._write(line))
+            self.assertEqual(self.stored(), room)
+            self.assertEqual(log.state, sink.STATE_UNAVAILABLE)
+            self.assertFalse(log.accepts_new_work())
+
+    def test_a_full_segment_rotates_within_the_budget_and_keeps_every_record(self):
+        with patch.object(sink, "SEGMENT_BYTES", 2048):
+            log = self.build(max_directory_bytes=4096).open()
+            self.addCleanup(log.close_sync)
+            written = 0
+            while log._write(events.encode_record(log.record("runtime.starting"))):
+                written += 1
+                if written > 200:  # pragma: no cover - the budget is 4 KiB
+                    break
+            self.assertTrue(log._sync())
+            self.assertGreater(written, 0)
+            records = read_log(self.temp)
+            # Every accepted record is stored exactly once and a refusal leaves no half record
+            # behind: the stored bytes reconcile with the count of accepted records.
+            self.assertEqual(
+                [record["event"] for record in records].count("runtime.starting"), written
+            )
+            sequences = [record["sequence"] for record in records]
+            self.assertEqual(len(sequences), len(set(sequences)))
+            self.assertLessEqual(self.stored(), 4096)
+            self.assertEqual(log.state, sink.STATE_UNAVAILABLE)
+            self.assertFalse(log.accepts_new_work())
+            # Every allocated number is accounted for: 1..N are stored, one record per number and
+            # no hole inside the range; N+1 is the record that was refused, and N+2 is the
+            # emergency line that announces the refusal -- which by construction cannot be written
+            # into the file that just refused it. That line carries its own number, so an operator
+            # can match every missing sequence to its cause.
+            self.assertEqual(sink.sequence_gaps(records), {})
+            self.assertEqual(sorted(sequences), list(range(1, len(records) + 1)))
+            emergency = json.loads(self.stderr.getvalue().strip().splitlines()[-1])
+            self.assertEqual(emergency["event"], "log.capacity_exceeded")
+            self.assertEqual(emergency["sequence"], len(records) + 2)
+
+    def test_recovery_is_declared_only_after_its_own_record_is_durable(self):
+        log = self.build().open()
+        self.addCleanup(log.close_sync)
+        log._degrade(sink.REASON_IO)
+        calls = []
+        real = sink.os.fsync
+
+        def failing(fd):
+            calls.append(fd)
+            if len(calls) == 1:
+                # The record is written into the buffer, but the sync that would make it durable
+                # fails: that is not a successful write and must not be reported as one.
+                raise OSError("injected")
+            return real(fd)
+
+        with patch.object(sink.os, "fsync", failing):
+            self.assertTrue(log._write(events.encode_record(log.record("runtime.starting"))))
+            self.assertFalse(log._sync())
+        self.assertEqual(log.state, sink.STATE_UNAVAILABLE)
+        self.assertFalse(log.accepts_new_work())
+        # A real flush+fsync of the recovery record is what declares the healthy state again.
+        self.assertTrue(log._recover())
+        self.assertEqual(log.state, sink.STATE_OK)
+        self.assertIsNone(log.reason)
+        self.assertIn("log.recovered", [record["event"] for record in read_log(self.temp)])
+
+    def test_an_interrupted_write_preserves_every_stored_byte(self):
+        log = self.build().open()
+        self.addCleanup(log.close_sync)
+        self.assertTrue(log._write(events.encode_record(log.record("runtime.starting"))))
+        self.assertTrue(log._sync())
+        before = self.stored()
+        good = log._handle
+
+        class _Exploding:
+            def __getattr__(self, name):
+                return getattr(good, name)
+
+            def write(self, data):
+                good.write(data[:10])
+                raise OSError("injected")
+
+        log._handle = _Exploding()
+        self.assertFalse(log._write(events.encode_record(log.record("runtime.started"))))
+        log._handle = good
+        self.assertEqual(log.state, sink.STATE_UNAVAILABLE)
+        self.assertFalse(log.accepts_new_work())
+        # The sink refuses new work; it never rewrites, truncates or repairs by deleting, and the
+        # records that were already stored are still readable.
+        self.assertGreaterEqual(self.stored(), before)
+        self.assertEqual([record["event"] for record in read_log(self.temp)], ["runtime.starting"])
+
+
+class TerminalCorrelationTests(ObservedTestCase, unittest.IsolatedAsyncioTestCase):
+    """R3: the request terminal is written inside its own correlation context.
+
+    The reproduction posted a Chat request, then read the receipt with a correlation of its own
+    and found ``request.finished`` with a null correlation. A non-forwarding success has no
+    transfer path to record its terminal, so the middleware must do it before releasing the
+    context.
+    """
+
+    async def asyncSetUp(self):
+        await self.observe()
+
+    def presented(self):
+        return "b" * 32
+
+    async def test_a_receipt_read_keeps_its_own_correlation(self):
+        async with await self.client.post(
+            self.harness.url + "/v1/chat/completions",
+            json=self.harness.body(),
+            headers=self.harness.headers(request_id="probe-receipt"),
+        ) as response:
+            self.assertEqual(response.status, 200)
+            await response.read()
+        correlation = self.presented()
+        async with await self.client.get(
+            self.harness.url + "/internal/v1/model-requests/probe-receipt",
+            headers=self.harness.headers(correlation=correlation),
+        ) as response:
+            self.assertEqual(response.status, 200)
+            await response.json()
+        await self.harness.settle()
+        accepted = [
+            record
+            for record in self.harness.named("request.accepted")
+            if record["correlation_id"] == correlation
+        ]
+        terminals = [
+            record
+            for record in self.harness.named("request.finished")
+            if record["correlation_id"] == correlation
+        ]
+        # The non-forwarding success has no transfer path to close it: the middleware must
+        # record the terminal inside the same correlation context it opened.
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(len(terminals), 1)
+        self.assertEqual(terminals[0]["correlation_id"], accepted[0]["correlation_id"])
+        self.assertEqual(terminals[0]["outcome"], "succeeded")
+
+    async def test_a_usage_report_keeps_its_own_correlation(self):
+        correlation = self.presented()
+        async with await self.client.get(
+            self.harness.url + "/internal/v1/model-usage",
+            headers=self.harness.headers(correlation=correlation),
+        ) as response:
+            self.assertEqual(response.status, 200)
+            await response.read()
+        await self.harness.settle()
+        correlated = [
+            record for record in self.harness.records() if record["correlation_id"] == correlation
+        ]
+        self.assertEqual(
+            [record["event"] for record in correlated],
+            ["request.accepted", "request.finished"],
+        )
+        self.assertEqual(correlated[-1]["outcome"], "succeeded")
+
+    async def test_a_rejected_request_keeps_its_own_correlation(self):
+        correlation = self.presented()
+        headers = self.harness.headers(correlation=correlation)
+        headers["Authorization"] = "Bearer not-a-real-credential"
+        async with await self.client.post(
+            self.harness.url + "/v1/chat/completions", json=self.harness.body(), headers=headers
+        ) as response:
+            self.assertEqual(response.status, 401)
+            await response.read()
+        await self.harness.settle()
+        rejected = [
+            record for record in self.harness.records() if record["correlation_id"] == correlation
+        ]
+        # The refusal and its own provenance event both carry the correlation of the request that
+        # was refused, rather than a null one.
+        self.assertEqual(
+            [record["event"] for record in rejected],
+            ["request.accepted", "request.unauthenticated"],
+        )
+        self.assertEqual(rejected[-1]["error_code"], "unauthorized")
+
+    async def test_concurrent_requests_never_swap_correlations(self):
+        presented = [f"{index:032x}" for index in range(1, 9)]
+
+        async def call(correlation):
+            async with await self.client.get(
+                self.harness.url + "/internal/v1/model-usage",
+                headers=self.harness.headers(correlation=correlation),
+            ) as response:
+                await response.read()
+                return response.status
+
+        statuses = await asyncio.gather(*(call(value) for value in presented))
+        self.assertEqual(statuses, [200] * len(presented))
+        await self.harness.settle()
+        for correlation in presented:
+            names = [
+                record["event"]
+                for record in self.harness.records()
+                if record["correlation_id"] == correlation
+            ]
+            self.assertEqual(names, ["request.accepted", "request.finished"])
+        # Nothing was recorded under a correlation this process never saw, and no request was
+        # left without a terminal.
+        known = set(presented)
+        strangers = {
+            record["correlation_id"]
+            for record in self.harness.records()
+            if record["correlation_id"] is not None and record["correlation_id"] not in known
+        }
+        self.assertEqual(strangers, set())
+        self.assertEqual(len(self.harness.named("request.accepted")), len(presented))
+        self.assertEqual(len(self.harness.named("request.finished")), len(presented))
+
+    async def test_a_cancelled_request_leaks_its_context_to_nobody(self):
+        self.harness.services.mode = "hold"
+        correlation = self.presented()
+        request = asyncio.create_task(
+            self.client.post(
+                self.harness.url + "/v1/chat/completions",
+                json=self.harness.body(),
+                headers=self.harness.headers(correlation=correlation),
+            )
+        )
+        await asyncio.wait_for(self.harness.services.started.wait(), 2)
+        request.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await request
+        self.harness.services.mode = "record"
+        self.harness.services.release.set()
+        await asyncio.sleep(0.05)
+        after = "c" * 32
+        async with await self.client.get(
+            self.harness.url + "/internal/v1/model-usage",
+            headers=self.harness.headers(correlation=after),
+        ) as response:
+            self.assertEqual(response.status, 200)
+            await response.read()
+        await self.harness.settle()
+        # The request that ran after the cancellation owns its own correlation, and the cancelled
+        # one never handed its context to anybody else.
+        self.assertEqual(
+            [
+                record["event"]
+                for record in self.harness.records()
+                if record["correlation_id"] == after
+            ],
+            ["request.accepted", "request.finished"],
+        )
+        cancelled = [
+            record for record in self.harness.records() if record["correlation_id"] == correlation
+        ]
+        self.assertTrue(cancelled, "the cancelled request recorded nothing at all")
+        # The cancelled request's own start and end carry its correlation, and none of its records
+        # was re-labelled with the later request's context.
+        self.assertTrue(
+            {"request.accepted", "request.finished"} <= {record["event"] for record in cancelled}
+        )
+        self.assertNotIn(after, [record["correlation_id"] for record in cancelled])
 
 
 if __name__ == "__main__":

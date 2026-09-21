@@ -259,6 +259,14 @@ class ObservedGateway:
     def records(self):
         return read_log(self.log_directory)
 
+    async def settle(self):
+        """Wait until every event submitted so far is on durable storage.
+
+        The sink writes on its own thread, so reading the files without this barrier would be a
+        race. The barrier is a real durable acknowledgement, not a sleep.
+        """
+        return await self.observability.flush()
+
     def named(self, event_name):
         return only(self.log_directory, event_name)
 
