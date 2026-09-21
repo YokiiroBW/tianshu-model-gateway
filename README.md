@@ -76,3 +76,23 @@ git diff --check
 - 新私有表 `request_metrics`/`native_request_metrics` 首次在既有部署上启动时先整库备份 `<ledger>.ts043-backup` 再建表，既有表与旧回执不变，缺新表的历史行计入 `coverage.unmetered_total`。不新增全量内容日志、后台遥测、全表内存扫描或费用估算，也不修改根 contracts 与依赖锁。
 - 诊断是尽力而为的旁路：回执先写、私有度量后写且各自独立事务。度量写入失败只留一条无值告警，不回滚权威回执、不改变 `reason`、不截断已交付的 JSON/SSE 字节、不重试；该次尝试只出现在 `coverage.unmetered_total`，不会被当作 0 用量或 0 延迟。超出 SQLite 整数范围的供应商 token 数（如 `2**63`）仍原样保留在回执与响应中，私有投影不索引该值并把该行记为不完整。
 - 命令、参数与验证界限见[运行说明](docs/gateway-runtime.md)，取舍见[TS-043 决定](docs/decisions/TS-043-usage-report.md)，交付见[TS-043 交接](docs/handoffs/TS-043.md)。
+
+## TS-103 全量运行日志、只读探针与容器基础
+
+`src/tianshu_gateway/observability/` 是独立观察适配器，只消费别处已经形成的事实，不拥有任何业务规则：`events.py` 是静态事件目录与冻结封闭记录，`sink.py` 是有界、持久、单写者的文件汇，`health.py` 是只读存活/就绪面，`__init__.py` 是入口装配点。业务模块可以导入它，它不导入任何业务模块（`tests/test_observability.py::EntryAssemblyTests` 以源码扫描固定该方向）。
+
+```powershell
+.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_observability.py' -v
+.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_health.py' -v
+.venv/Scripts/python.exe -B -m unittest discover -s tests -p 'test_container_runtime.py' -v
+```
+
+- **事件**：34 个已登记事件名，等级/结果/错误码都是闭合集合；记录字段顺序、`additionalProperties:false`、每行 ≤4096 字节 + LF 与冻结的 `contracts/diagnostics/v1` 1.0.0 一致，启动时按 manifest 摘要逐文件校验，不一致则拒绝启动。全部事件按发生次数登记，不采样、不按成功过滤、不按服务名过滤；每个请求恰好一个终态事件（先到者胜）。
+- **不泄漏**：事件字段里没有正文、提示词、token、凭据、URL、异常文本或供应商原始结构。`X-Tianshu-Correlation-Id` 只接受 `^[a-f0-9]{32}$`，缺失或非法一律生成新值，presented 值既不回显也不记录；该关联头只向已登记的内部平台快照调用传播，绝不发往模型上游。
+- **落盘先于副作用**：每次尝试在真正发往上游前，先写一条 `upstream.call_started` 并 `fsync`；等待时不持调度锁、不持数据库事务、不持转发写。日志汇不可用（IO 失败或目录预算耗尽）时该次新业务以固定 503 `dependency_unavailable` 拒绝——不转发、不建回执行、不重发此前已交付的尝试。未配置日志目录是显式的非持久降级（stderr + `log.non_durable`），就绪永远不为 ready，不会伪装成生产持久日志。
+- **有界且不删除**：内存队列 ≤1024 条且 ≤8 MiB，段 64 MiB，目录默认 1 GiB（可配 32 MiB–64 GiB）。容量或队列满时丢弃**新**记录并显式降级，既不淘汰旧记录也不删除、截断、覆盖任何已存文件。段名含 `instance_id`，序号单调且空洞可检测；恢复只能由真实成功写入证明。
+- **只读探针**：`GET /health/live` 公开返回 `{"status":"alive"}`；`GET /health/ready` 需要独立凭据 `TIANSHU_DIAGNOSTICS_TOKEN`（缺凭据 401，未配置 503），返回闭合的 `status/service/checks`，无 `checked_at`、无计数、无路径、无环境值、无业务标识。必要项为 `configuration/contracts/runtime/ledger/logging` 前五项；`platform`/`model` 无实测一律 `not_verified`，只在内部有效期内有真实成功才 `ok`，到期回 `not_verified`。两个探针都不写任何日志、不建目录、不迁移、不开新数据库连接、不刷新配置缓存、不占用业务容量；并发上限 2（第三个 429），预算超时按未就绪回答。
+- **容器基础**：`Dockerfile`（多阶段、`uv sync --locked --no-dev`、非 root uid 10001、`STOPSIGNAL SIGTERM`、健康检查只打 `/health/live` 且强制 TLS 校验）、`.dockerignore`、`scripts/healthcheck.py`（仅标准库、无凭据、无明文降级）与 `config/container.example.json`。**本机没有容器运行时，镜像从未构建或运行**，因此只声明“定义已写好”，不声明构建通过；未验证项见[部署说明](docs/deployment.md)与[TS-103 交接](docs/handoffs/TS-103.md)。
+- **维护命令**：`python -m tianshu_gateway log-recovery-check --settings <部署 JSON>` 是唯一能证明日志恢复的动作：重新测量目录、真实写一条并 `fsync`，成功退出 0、失败退出 1、未配置退出 2。它不碰业务状态、不建回执行、不调用模型。
+
+部署字段、挂载点、环境变量与未验证清单见[部署说明](docs/deployment.md)；本卡交付见[TS-103 交接](docs/handoffs/TS-103.md)。本块验证只用隔离夹具与 loopback 替身，不代表生产部署、容器构建或跨产品联合验收已完成。

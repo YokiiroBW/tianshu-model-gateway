@@ -32,6 +32,13 @@ from .contracts import Rejected
 
 LOG = logging.getLogger("tianshu_gateway")
 
+
+def _no_observation(name):
+    """The default observation port: this module records no runtime event on its own."""
+    del name
+    return None
+
+
 NATIVE_IDENTITY_FIELDS = ("contract", "principal_id", "caller_service", "credential_namespace")
 
 CORE_TABLES = (
@@ -246,6 +253,9 @@ class Diagnostics:
         self.connection = sqlite3.connect(path)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=1000")
+        # The observation port is injected by the caller and defaults to silence, so this
+        # module keeps owning only its tables and its transaction rules.
+        self._observer = _no_observation
         # Read the table set before creating anything, so a fresh database is not
         # mistaken for an existing deployment that needs an upgrade copy.
         deployed = table_names(self.connection)
@@ -410,18 +420,25 @@ class Diagnostics:
         keyed by the same identity as the receipt, so a repeated terminal observation
         replaces the earlier row instead of adding a second one.
         """
-        with self.connection:
-            self.connection.execute(
-                "UPDATE requests SET receipt=?,reason=?,elapsed_ms=?,upstream_status=? WHERE service=? AND request_id=?",
-                (
-                    json.dumps(receipt),
-                    reason,
-                    elapsed_ms,
-                    upstream_status,
-                    receipt["caller_service"],
-                    receipt["request_id"],
-                ),
-            )
+        try:
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE requests SET receipt=?,reason=?,elapsed_ms=?,upstream_status=? WHERE service=? AND request_id=?",
+                    (
+                        json.dumps(receipt),
+                        reason,
+                        elapsed_ms,
+                        upstream_status,
+                        receipt["caller_service"],
+                        receipt["request_id"],
+                    ),
+                )
+        except Exception:
+            # The authoritative receipt could not be written. That failure still surfaces to
+            # the caller; this observation only records that it happened, with a fixed code and
+            # without any exception text, SQL or path.
+            self._observe("receipt.persist_failed")
+            raise
         self.project_metric(
             "request_metrics",
             "INSERT OR REPLACE INTO request_metrics "
@@ -525,18 +542,22 @@ class Diagnostics:
         native bytes.
         """
         identity = native_identity(receipt)
-        with self.connection:
-            self.connection.execute(
-                "UPDATE native_requests SET receipt=?,reason=?,elapsed_ms=?,upstream_status=? WHERE contract=? AND principal_id=? AND caller_service=? AND credential_namespace=? AND request_id=?",
-                (
-                    json.dumps(receipt),
-                    reason,
-                    elapsed_ms,
-                    upstream_status,
-                    *identity,
-                    receipt["request_id"],
-                ),
-            )
+        try:
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE native_requests SET receipt=?,reason=?,elapsed_ms=?,upstream_status=? WHERE contract=? AND principal_id=? AND caller_service=? AND credential_namespace=? AND request_id=?",
+                    (
+                        json.dumps(receipt),
+                        reason,
+                        elapsed_ms,
+                        upstream_status,
+                        *identity,
+                        receipt["request_id"],
+                    ),
+                )
+        except Exception:
+            self._observe("receipt.persist_failed")
+            raise
         self.project_metric(
             "native_request_metrics",
             "INSERT OR REPLACE INTO native_request_metrics "
@@ -564,6 +585,36 @@ class Diagnostics:
             (*identity, request_id),
         ).fetchone()
         return json.loads(row[0]) if row else None
+
+    def observe(self, observer):
+        """Inject the observation port; the default records nothing.
+
+        This module keeps owning only its tables and its transaction rules: the port receives
+        one fixed, already-registered event name and never a row, a statement or an exception.
+        """
+        self._observer = observer if callable(observer) else _no_observation
+        return self
+
+    def _observe(self, name):
+        """Report one fixed observation. A failing port is swallowed, never propagated."""
+        try:
+            self._observer(name)
+        except Exception:
+            return
+
+    def reachable(self):
+        """Read-only reachability of the ledger this process already has open.
+
+        Deliberately opens nothing: a readiness probe that connected on demand could create a
+        database file, recover a journal or take a write lock, and none of that is allowed on
+        a read-only probe. One read statement on the existing connection answers the only
+        question readiness asks.
+        """
+        try:
+            self.connection.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            return False
 
     def close(self):
         self.connection.close()

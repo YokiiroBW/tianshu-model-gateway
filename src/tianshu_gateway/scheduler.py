@@ -39,6 +39,12 @@ Observation is a side channel owned by the caller. This module only *forms* boun
 inside its lock and hands them out afterwards through ``drain``; it performs no logging, IO
 or diagnostics call while holding the lock, and nothing it hands out can change an admission
 decision.
+
+TS-103 adds a second, equally narrow observation port next to the private ledger sink:
+``observe`` receives the very same bounded facts and a caller may turn them into registered
+runtime events. It is the same object, formed in the same place, under the same rule -- no
+decision reads it back, and one fact about *waiting* (``queued``) is marked as observation
+only so the private admission table keeps its existing four outcomes.
 """
 
 from __future__ import annotations
@@ -72,6 +78,9 @@ QUEUE_FULL = "queue_full"
 DEADLINE_EXCEEDED = "deadline_exceeded"
 CANCELLED = "cancelled"
 DUPLICATE = "duplicate"
+# Formed only for the event side channel: a request really did have to wait. It is not an
+# admission decision and never reaches the private admission table.
+QUEUED = "queued"
 
 
 class AdmissionRefused(Exception):
@@ -105,17 +114,22 @@ class AdmissionFact:
     """One bounded observation produced under the lock and emitted after it is released.
 
     Plain data with no reference to a store, a connection or the ledger: the module that owns
-    the private tables decides how to record it.
+    the private tables decides how to record it. ``observable_only`` marks a fact that exists
+    for the runtime-event side channel alone -- it was still formed under the lock and can
+    still change nothing.
     """
 
-    __slots__ = ("service", "request_id", "workload_class", "outcome", "wait_ms")
+    __slots__ = ("service", "request_id", "workload_class", "outcome", "wait_ms", "observable_only")
 
-    def __init__(self, service, request_id, workload_class, outcome, wait_ms):
+    def __init__(
+        self, service, request_id, workload_class, outcome, wait_ms, observable_only=False
+    ):
         self.service = service
         self.request_id = request_id
         self.workload_class = workload_class
         self.outcome = outcome
         self.wait_ms = wait_ms
+        self.observable_only = observable_only
 
     def as_row(self):
         """The field names the private ledger uses, so the caller needs no knowledge of it."""
@@ -247,6 +261,7 @@ class BoundedAdmissionScheduler:
         # Facts formed under the lock, emitted only after it is released.
         self._facts = []
         self._sink = _ignore
+        self._observer = _ignore
         # Fairness state: the class that must be offered the next free slot first. It starts
         # with interactive so an idle pool keeps interactive latency, and flips on every
         # granted permit, which is what bounds how often one class can overtake the other.
@@ -311,9 +326,11 @@ class BoundedAdmissionScheduler:
         facts, self._facts = self._facts, []
         return facts
 
-    def _form(self, service, request_id, workload_class, outcome, wait_ms):
+    def _form(self, service, request_id, workload_class, outcome, wait_ms, observable_only=False):
         """Record one bounded fact. Called with the lock held and does no IO."""
-        self._facts.append(AdmissionFact(service, request_id, workload_class, outcome, wait_ms))
+        self._facts.append(
+            AdmissionFact(service, request_id, workload_class, outcome, wait_ms, observable_only)
+        )
 
     # -- admission ----------------------------------------------------------------------
 
@@ -333,6 +350,11 @@ class BoundedAdmissionScheduler:
             await self._pump()
             if waiter.done:
                 return waiter
+            async with self.lock:
+                # The request really is leaving for the queue: this is the only place a
+                # "queued" fact is formed, so a request served immediately never claims to
+                # have waited.
+                self._form(service, waiter.key, workload_class, QUEUED, None, True)
             return await self._wait(waiter, timeout_ms)
         finally:
             self.flush()
@@ -349,14 +371,22 @@ class BoundedAdmissionScheduler:
     def flush(self):
         """Emit formed facts outside the lock; a failing sink only degrades.
 
-        The sink receives the ledger's field names, so the caller can wire the private
-        recording call straight in without an adapter of its own.
+        The ledger sink receives the ledger's field names, so the caller can wire the private
+        recording call straight in without an adapter of its own. The event observer receives
+        the fact itself, including the observation-only one the ledger deliberately does not
+        know about. Both are best effort: neither can change an admission decision, and a
+        failure in either is a bounded local warning rather than an exception on this path.
         """
         for fact in self.drain():
+            if not fact.observable_only:
+                try:
+                    self._sink(**fact.as_row())
+                except Exception:
+                    LOG.warning("admission_metric_degraded outcome=%s", fact.outcome)
             try:
-                self._sink(**fact.as_row())
+                self._observer(fact)
             except Exception:
-                LOG.warning("admission_metric_degraded outcome=%s", fact.outcome)
+                LOG.warning("admission_observation_degraded outcome=%s", fact.outcome)
 
     def record(self, sink):
         """Wire the narrow fact sink; it is called with no lock held.
@@ -366,6 +396,15 @@ class BoundedAdmissionScheduler:
         delay fact emission, never an admission decision or a forwarded byte.
         """
         self._sink = sink if callable(sink) else _ignore
+        return self
+
+    def observe(self, observer):
+        """Wire the event observer for the same facts; it is called with no lock held.
+
+        Kept separate from :meth:`record` so the private admission projection keeps exactly its
+        own outcome vocabulary: an event-only fact can never widen the ledger's table.
+        """
+        self._observer = observer if callable(observer) else _ignore
         return self
 
     async def _enroll(self, service, workload_class, declared_workload, key, provider_id):

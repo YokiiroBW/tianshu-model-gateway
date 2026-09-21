@@ -1,0 +1,33 @@
+# Build context is the checkout. Everything the image does not need at build time is excluded,
+# so no test fixture, no local virtualenv, no runtime state and no credential file can reach a
+# layer even by accident.
+
+# Version control and local tooling state.
+.git
+.gitignore
+.ruff_cache
+.venv
+.runtime
+.env
+.env.*
+
+# Tests and their fixtures are never part of the image: the deployed process runs no test code.
+tests
+
+# Documentation and examples are read by humans, not by the runtime.
+docs
+*.md
+
+# Local build and bytecode residue.
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+
+# Private ledger and log files must never be baked into an image.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+*.jsonl

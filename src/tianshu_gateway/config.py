@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import ipaddress
+import logging
 import os
 import socket
 import time
@@ -15,6 +16,9 @@ import aiohttp
 from aiohttp.abc import AbstractResolver
 
 from .contracts import Rejected, loads
+from .observability import CORRELATION_HEADER, current_correlation
+
+LOG = logging.getLogger("tianshu.gateway")
 
 
 def utcnow():
@@ -224,10 +228,24 @@ class SourceUnavailable(Rejected):
 
 
 class HttpConfigSource:
-    def __init__(self, session, contracts, targets, secrets, base_url, credential_ref, origin_env):
+    def __init__(
+        self,
+        session,
+        contracts,
+        targets,
+        secrets,
+        base_url,
+        credential_ref,
+        origin_env,
+        on_success=None,
+    ):
         targets.check(base_url)
         self.session, self.contracts, self.secrets = session, contracts, secrets
         self.base_url, self.credential_ref, self.origin_env = base_url, credential_ref, origin_env
+        # Observation seam: called once per snapshot this process really fetched and verified.
+        # It is never called for a cache hit, it cannot change the returned document, and a
+        # failure inside it is confined to the observation side channel.
+        self.on_success = on_success
 
     async def fetch(self, version):
         request_id = str(uuid.uuid4())
@@ -241,6 +259,15 @@ class HttpConfigSource:
         }
         self.contracts.validate("model#config_request", body)
         headers = {"Authorization": "Bearer " + self.secrets.resolve(self.credential_ref)}
+        # TS-103: propagate the correlation of the request that triggered this already
+        # registered internal peer call, so one attempt can be followed across the gateway and
+        # the platform. The value is the same validated or freshly generated one the request
+        # carries; it is never taken from the payload, never replaces the credential, never
+        # changes the body and never reaches a model upstream. A fetch that no request
+        # triggered (start-up validation, a background refresh) carries no header at all.
+        correlation = current_correlation()
+        if correlation is not None:
+            headers[CORRELATION_HEADER] = correlation
         try:
             async with self.session.post(
                 self.base_url + "/internal/v1/model-config/snapshot",
@@ -264,6 +291,11 @@ class HttpConfigSource:
                 self.contracts.validate("model#config_response", document)
                 if document["request_id"] != request_id:
                     raise Rejected("invalid_input", 400)
+                if self.on_success is not None:
+                    try:
+                        self.on_success()
+                    except Exception:
+                        LOG.warning("platform_observation_failed")
                 return document
         except (aiohttp.ClientError, TimeoutError):
             raise SourceUnavailable() from None

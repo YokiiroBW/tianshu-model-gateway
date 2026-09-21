@@ -1,0 +1,65 @@
+{
+  "contract_directory": "/etc/tianshu/contracts",
+  "diagnostics_contract_directory": "/etc/tianshu/contracts/diagnostics/v1",
+  "diagnostics_path": "/var/lib/tianshu/diagnostics.sqlite",
+  "platform_base_url": "https://platform.internal",
+  "platform_credential_ref": "platform",
+  "platform_origin_env": "TIANSHU_ORIGIN_ASSERTION",
+  "secret_references": {
+    "platform": "TIANSHU_PLATFORM_TOKEN",
+    "companion": "TIANSHU_COMPANION_TOKEN",
+    "provider": "TIANSHU_PROVIDER_TOKEN"
+  },
+  "targets": [
+    {
+      "base_url": "https://platform.internal",
+      "addresses": ["10.0.0.10"],
+      "allow_private_http": false
+    },
+    {
+      "base_url": "https://model.internal",
+      "addresses": ["10.0.0.11"],
+      "allow_private_http": false
+    }
+  ],
+  "clients": [
+    {
+      "service": "companion",
+      "credential_ref": "companion",
+      "provider_id": "provider-primary",
+      "config_version": 1,
+      "internal": false,
+      "allowed_versions": []
+    }
+  ],
+  "native_enabled": false,
+  "native_contract_directory": null,
+  "native_clients": [],
+  "revoked_native_versions": [],
+  "max_request_bytes": 1048576,
+  "max_response_bytes": 8388608,
+  "max_concurrent": 16,
+  "max_provider_concurrent": 4,
+  "max_timeout_ms": 180000,
+  "request_read_timeout": 5.0,
+  "config_refresh_seconds": 30.0,
+  "revoked_versions": [],
+  "scheduling": {
+    "max_in_flight": 16,
+    "max_provider_in_flight": 4,
+    "interactive_reserve": 4,
+    "max_queue_length": 256,
+    "wait_timeout_ms": 30000
+  },
+  "workload_bindings": {
+    "bindings": {"companion": "interactive"},
+    "default_class": "background"
+  },
+  "observability": {
+    "log_directory": "/var/log/tianshu",
+    "max_directory_bytes": 1073741824,
+    "probe_token_env": "TIANSHU_DIAGNOSTICS_TOKEN",
+    "probe_budget_ms": 1000,
+    "observation_validity_seconds": 60
+  }
+}

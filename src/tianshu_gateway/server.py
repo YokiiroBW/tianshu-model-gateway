@@ -5,6 +5,7 @@ import hmac
 import logging
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -42,6 +43,16 @@ from .native import (
     route_receipt,
     select_native_route,
 )
+from .observability import (
+    CORRELATION_HEADER,
+    CheckProviders,
+    ObservabilitySettings,
+    bind_correlation,
+    reset_correlation,
+)
+from .observability import events as observation_events
+from .observability import health as probe_health
+from .observability.events import load_contract
 from .responses import send_responses, validate_request
 from .routing import PROTOCOL, SecretGuard, StreamObserver, apply_fields, prepare, record_usage
 from .scheduler import AdmissionRefused, BoundedAdmissionScheduler, bind
@@ -61,6 +72,79 @@ NATIVE_USAGE_PATH = "/internal/v1/native-model-usage"
 REQUEST_ID = web.RequestKey("request_id", str)
 FORWARD_STARTED = web.RequestKey("forward_started", bool)
 STREAM_RESPONSE = web.RequestKey("stream_response", web.StreamResponse)
+# TS-103 observation state of one in-flight request. Both are per-request facts about what has
+# already been recorded, so "one terminal per request" is enforced rather than hoped for.
+ACCEPTED_RECORDED = web.RequestKey("accepted_recorded", bool)
+TERMINAL_RECORDED = web.RequestKey("terminal_recorded", bool)
+FIRST_OUTPUT_RECORDED = web.RequestKey("first_output_recorded", bool)
+WORK_STARTED = web.RequestKey("work_started", float)
+# The two read-only probes. They are read from the URL path before routing so the request
+# middleware can promise they record nothing at all, whichever route answers them.
+LIVE_PATH = "/health/live"
+READY_PATH = "/health/ready"
+PROBE_PATHS = frozenset({LIVE_PATH, READY_PATH})
+NO_STORE = {"Cache-Control": "no-store"}
+JSON_TYPE = "application/json"
+
+# Exactly one of these is recorded per request, and the first one wins. The rest of the
+# catalogue describes a stage of the same request and never ends it.
+TERMINAL_EVENTS = frozenset(
+    {
+        "request.finished",
+        "request.rejected",
+        "request.unauthenticated",
+        "request.revoked",
+        "request.route_unmatched",
+        "request.disconnected",
+        "request.cancelled",
+        "request.queue_full",
+        "request.queue_expired",
+        "request.duplicate",
+    }
+)
+
+# The terminal observation of one upstream attempt, keyed by the attempt reason the transport
+# already uses. Nothing here is a new decision: each entry is the fixed event vocabulary for a
+# reason the forwarding path already produced, and both tables below are asserted against the
+# registered catalogue by the tests.
+ATTEMPT_TERMINALS = {
+    "completed": ("succeeded", None),
+    "response_completed": ("succeeded", None),
+    "response_failed": ("failed", "upstream_http_error"),
+    "response_incomplete": ("unknown", "result_unknown"),
+    "observation_incomplete": ("unknown", "result_unknown"),
+    "upstream_http_error": ("failed", "upstream_http_error"),
+    "incomplete_stream": ("unknown", "result_unknown"),
+    "transport_unknown": ("unknown", "result_unknown"),
+    "timeout_unknown": ("unknown", "timeout"),
+    "cancelled_unknown": ("cancelled", None),
+}
+UNKNOWN_ATTEMPT_TERMINAL = ("unknown", "result_unknown")
+# The same fixed pairs, addressed by the outcome the authoritative receipt already carries.
+OUTCOME_TERMINALS = {
+    "succeeded": ("succeeded", None),
+    "failed": ("failed", "upstream_http_error"),
+    "unknown": ("unknown", "result_unknown"),
+    "cancelled": ("cancelled", None),
+}
+ROUTE_UNMATCHED_STATUSES = frozenset({404, 405})
+HTTP_STATUS_CODES = {
+    400: "invalid_input",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    408: "timeout",
+    409: "version_conflict",
+    413: "payload_too_large",
+    429: "queue_full",
+    501: "unsupported_operation",
+    502: "result_unknown",
+    503: "dependency_unavailable",
+}
+
+# The request being served, so a fact another module forms on this task can be attributed to
+# it without that module ever seeing an HTTP request.
+_CURRENT_REQUEST = ContextVar("tianshu_current_request", default=None)
 
 
 @dataclass
@@ -90,6 +174,11 @@ class Settings:
     # so an old deployment keeps its exact semantics without being edited.
     scheduling: SchedulingPolicy | None = None
     workload_bindings: Classification | None = None
+    # TS-103 observation input. Both are absent from an existing deployment document and both
+    # defaults reproduce the previous behaviour exactly: no runtime event is emitted and no
+    # health surface is configured, so an old document still starts unchanged.
+    diagnostics_contract_directory: str | None = None
+    observability: ObservabilitySettings | None = None
 
     @property
     def policy(self):
@@ -117,6 +206,16 @@ class Settings:
             raise ValueError("positive limits required")
         if self.config_refresh_seconds < 0:
             raise ValueError("nonnegative refresh interval required")
+        if self.diagnostics_contract_directory is not None and (
+            not isinstance(self.diagnostics_contract_directory, str)
+            or not self.diagnostics_contract_directory
+        ):
+            raise ValueError("explicit diagnostics contract directory required")
+        if self.observability is not None:
+            # An unusable observation configuration is refused before the server binds: a
+            # relative log directory or an out-of-range budget must not start and then claim
+            # to be logging.
+            self.observability.validate()
         if len({c.service for c in self.clients}) != len(self.clients):
             raise ValueError("one explicit grant per service required")
         if any(type(c.config_version) is not int or c.config_version < 1 for c in self.clients):
@@ -160,16 +259,29 @@ class Settings:
 
 
 class Gateway:
-    def __init__(self, settings, contracts, targets, session, diagnostics, scheduler=None):
+    def __init__(
+        self, settings, contracts, targets, session, diagnostics, scheduler=None, observability=None
+    ):
         self.settings, self.contracts, self.targets = settings, contracts, targets
         self.session, self.diagnostics = session, diagnostics
         self.scheduler = scheduler
+        # The observation adapter is assembled by the entry point and may be absent: without it
+        # this class emits no runtime event at all, which is exactly the pre-TS-103 behaviour.
+        self.observability = observability
+        self.contract_verified = False
+        self.closed = False
         self.classification = settings.classification
         if scheduler is not None:
             # One narrow port, no adapter: the scheduler forms bounded facts with no lock held
             # and the private ledger records them. The scheduler holds no store of its own, and
             # a failing or slow ledger can only lose a private row.
             scheduler.record(self.diagnostics.record_admission)
+            # The same bounded facts also feed the read-only runtime-event channel, through a
+            # second port. Neither port can change an admission decision or a forwarded byte.
+            scheduler.observe(self.admission_fact)
+        # The ledger reports its own fixed persistence failures here, so the adapter never has
+        # to read a row, a statement or an exception to observe one.
+        self.diagnostics.observe(self.receipt_failure)
         self.secrets = EnvSecrets(settings.secret_references)
         self.cache = ConfigCache(
             HttpConfigSource(
@@ -180,6 +292,9 @@ class Gateway:
                 settings.platform_base_url,
                 settings.platform_credential_ref,
                 settings.platform_origin_env,
+                # A verified snapshot is a real success of the platform dependency, so the
+                # readiness window is refreshed here and never on a cache hit.
+                on_success=self.note_platform,
             ),
             contracts,
             targets,
@@ -257,6 +372,191 @@ class Gateway:
     def pool_active(self):
         """True when this deployment runs the bounded pool instead of the plain counter."""
         return self.scheduler is not None and self.settings.policy.interactive_reserve > 0
+
+    # -- observation (assembly seam; never a business rule) ------------------------------
+
+    def record_event(self, request, name, **fields):
+        """Record one registered runtime event, enforcing one terminal per request.
+
+        A stage event is recorded every time it happens -- none of them is sampled, filtered by
+        success or rate limited -- while a terminal event is recorded exactly once: the first
+        terminal for a request wins and a later one is dropped instead of producing a second
+        end for the same attempt.
+        """
+        if self.observability is None:
+            return False
+        if name in TERMINAL_EVENTS:
+            if request is not None and request.get(TERMINAL_RECORDED):
+                return False
+            if request is not None:
+                request[TERMINAL_RECORDED] = True
+        return self.observability.event(name, **fields)
+
+    def admission_fact(self, fact):
+        """Turn one scheduler fact into its registered event; a pure observation port."""
+        name = observation_events.QUEUE_FACT_EVENTS.get(fact.outcome)
+        if name is None:
+            return
+        self.record_event(
+            _CURRENT_REQUEST.get(),
+            name,
+            duration_ms=fact.wait_ms,
+            error_code=observation_events.QUEUE_FACT_CODES.get(fact.outcome),
+        )
+
+    def receipt_failure(self, name):
+        """The ledger's own fixed failure observation; the name is already registered."""
+        if self.observability is None or name not in observation_events.REGISTRY:
+            return
+        self.observability.event(name, error_code=observation_events.UNKNOWN_ERROR_CODE)
+
+    async def begin_upstream(self, request):
+        """The durable record that must exist before this attempt may cause a side effect.
+
+        Emitted with no scheduler lock, no database transaction and no forward write held. A
+        record that is not on durable storage refuses the new business with the fixed 503: the
+        attempt is not forwarded, no ledger row was created, and no earlier attempt is retried.
+        """
+        if self.observability is None:
+            return True
+        started = request.get(WORK_STARTED)
+        durable = await self.observability.durable_event(
+            "upstream.call_started",
+            duration_ms=None if started is None else self.observability.elapsed_ms(started),
+        )
+        # A readiness change is reported here, by the path that just looked at the checks, and
+        # never by a probe. The full evaluation runs only when something is wrong or when the
+        # process had not established readiness yet, so the healthy path costs one attribute
+        # read and the ledger is not queried on every request.
+        if not durable or not self.observability.readiness_ok:
+            self.sync_readiness()
+        return durable
+
+    def sync_readiness(self):
+        """Determine readiness on a non-probe path and record the transition, if any."""
+        if self.observability is None:
+            return None
+        status = probe_health.ready_status(self.check_providers().collect())
+        self.observability.note_readiness(status)
+        return status
+
+    def note_platform(self):
+        """A real, verified platform snapshot answered; not a cache hit and not a probe."""
+        if self.observability is not None:
+            self.observability.observe_platform()
+
+    def attempt_terminal(self, reason):
+        """The fixed (outcome, error_code) pair of an attempt reason; never a provider value."""
+        return ATTEMPT_TERMINALS.get(reason, UNKNOWN_ATTEMPT_TERMINAL)
+
+    def outcome_terminal(self, receipt):
+        """The same fixed pair, read back from the receipt the transfer already produced."""
+        return OUTCOME_TERMINALS.get(receipt.get("outcome"), UNKNOWN_ATTEMPT_TERMINAL)
+
+    def finish_attempt(self, request, outcome, code, elapsed_ms, disconnected):
+        """Close the observation of one attempt: its upstream terminal and the request terminal.
+
+        Called after the authoritative receipt is written, so the runtime event never becomes
+        the record of whether the attempt succeeded. The outcome is copied from the reason the
+        transfer already produced; a logging failure here cannot change it, cannot retry it and
+        cannot abort bytes already delivered.
+        """
+        if self.observability is None:
+            return
+        if outcome == "succeeded":
+            self.observability.observe_model()
+        self.observability.event(
+            "upstream.call_finished", outcome=outcome, error_code=code, duration_ms=elapsed_ms
+        )
+        if disconnected:
+            # The downstream connection broke after the headers were sent: that is the end of
+            # this request, and it is reported as a disconnect rather than a completion.
+            self.record_event(
+                request, "request.disconnected", duration_ms=elapsed_ms, error_code="result_unknown"
+            )
+            return
+        self.record_event(
+            request, "request.finished", outcome=outcome, error_code=code, duration_ms=elapsed_ms
+        )
+
+    def note_first_output(self, request, latency_ms):
+        """Record the first output of this attempt, once, with the transport's own timing."""
+        if self.observability is None or request.get(FIRST_OUTPUT_RECORDED):
+            return
+        request[FIRST_OUTPUT_RECORDED] = True
+        self.observability.event("upstream.first_output", duration_ms=latency_ms)
+
+    # -- read-only readiness checks ------------------------------------------------------
+
+    @property
+    def assembled(self):
+        """Whether this runtime is actually assembled and has not been closed."""
+        return not self.closed
+
+    def check_providers(self):
+        """The eight fixed readiness checks, each a read of state this process already has."""
+        return CheckProviders(
+            configuration=self.configuration_check,
+            contracts=self.contracts_check,
+            runtime=self.runtime_check,
+            ledger=self.ledger_check,
+            logging=self.logging_check,
+            platform=self.platform_check,
+            model=self.model_check,
+            native=self.native_check,
+        )
+
+    def configuration_check(self):
+        """Required deployment inputs still resolve; nothing is written and nothing is fetched."""
+        if not self.assembled:
+            return "not_configured"
+        try:
+            for grant in (*self.settings.clients, *self.settings.native_clients):
+                self.secrets.resolve(grant.credential_ref)
+            self.secrets.resolve(self.settings.platform_credential_ref)
+        except Rejected:
+            return "failed"
+        return "ok"
+
+    def contracts_check(self):
+        if not self.assembled:
+            return "not_configured"
+        if self.observability is None or not self.contract_verified:
+            return "not_configured"
+        return "ok"
+
+    def runtime_check(self):
+        return "ok" if self.assembled else "failed"
+
+    def ledger_check(self):
+        """Short read-only reachability of the ledger this process already has open."""
+        if not self.assembled:
+            return "failed"
+        return "ok" if self.diagnostics.reachable() else "failed"
+
+    def logging_check(self):
+        if self.observability is None:
+            return "not_configured"
+        return self.observability.logging_status()
+
+    def platform_check(self):
+        """A remote dependency is ``ok`` only while a real success is recent enough."""
+        if self.observability is None:
+            return "not_verified"
+        return self.observability.platform_observation.status()
+
+    def model_check(self):
+        if self.observability is None:
+            return "not_verified"
+        return self.observability.model_observation.status()
+
+    def native_check(self):
+        """Native is optional: switched off it is ``not_configured`` and blocks nothing."""
+        if not self.settings.native_enabled:
+            return "not_configured"
+        if not self.assembled:
+            return "failed"
+        return "ok" if self.native_cache is not None else "failed"
 
     def requeue_reverify(self, request, grant, native, provider):
         """Re-read the caller's authority and credentials after the wait, before sending.
@@ -481,6 +781,13 @@ class Gateway:
                 secrets = self.secrets.known_values()
                 receipt = redact(receipt, secrets)
                 self.contracts.validate("model#route_receipt", receipt)
+                # The attempt that is about to cause a side effect is put on durable storage
+                # first, with no scheduler lock, no transaction and no forward write held. A
+                # record that is not durable refuses this new business before anything is sent:
+                # no ledger row exists yet and no upstream call is made, so nothing is retried
+                # and nothing already delivered is disturbed.
+                if not await self.begin_upstream(request):
+                    raise Rejected("dependency_unavailable", 503)
                 # A queued request is never recorded as forwarded: the ledger row is created
                 # after admission and only for an attempt that is about to be sent.
                 self.diagnostics.begin(receipt, turn_id)
@@ -572,6 +879,10 @@ class Gateway:
                 )
                 receipt = redact(receipt, (*secrets, credential))
                 self.contracts.validate("native#route_receipt", receipt)
+                # Same durable gate as Chat, and for the same reason: the native attempt that is
+                # about to cause a side effect is on durable storage before it is sent.
+                if not await self.begin_upstream(request):
+                    raise Rejected("dependency_unavailable", 503)
                 # Only a caller-supplied turn can be pinned; an external caller's turn id is a
                 # per-request correlation value, not a repeated client turn.
                 self.native_ledger.native_begin(receipt, turn_id if grant.internal else None)
@@ -590,6 +901,11 @@ class Gateway:
     ):
         """Stream native bytes downstream; never rewrite, retry or fabricate a terminal."""
         state = {"response": None, "pending": None, "stream": False}
+        started = time.monotonic()
+
+        def first_output():
+            """At most once per attempt, and only after the bytes already went downstream."""
+            self.note_first_output(request, int((time.monotonic() - started) * 1000))
 
         async def start_response(status, content_type):
             headers = {
@@ -637,6 +953,9 @@ class Gateway:
                 validate_receipt=lambda document: self.contracts.validate(
                     "native#route_receipt", document
                 ),
+                # A fixed observation seam: no chunk, no count, no content, and a failure inside
+                # it is confined to the event side channel.
+                on_first_output=first_output,
             )
         except Rejected:
             response = state["response"]
@@ -644,11 +963,21 @@ class Gateway:
                 # Headers are already on the wire: no local error frame can be appended.
                 if request.transport:
                     request.transport.abort()
+                outcome, code = self.outcome_terminal(receipt)
+                self.finish_attempt(
+                    request, outcome, code, int((time.monotonic() - started) * 1000), True
+                )
                 return response
+            outcome, code = self.outcome_terminal(receipt)
+            self.finish_attempt(
+                request, outcome, code, int((time.monotonic() - started) * 1000), False
+            )
             raise
         response = state["response"]
         if state["stream"]:
             await response.write_eof()
+        outcome, code = self.outcome_terminal(receipt)
+        self.finish_attempt(request, outcome, code, int((time.monotonic() - started) * 1000), False)
         return response
 
     async def forward(
@@ -667,6 +996,9 @@ class Gateway:
         upstream_status = None
         observer = None
         reason = "transport_unknown"
+        # True when the downstream connection broke after this attempt had already sent headers,
+        # which is what separates "the client went away" from "the attempt failed".
+        downstream_broken = False
         timeout = min(binding["timeout_ms"], self.settings.max_timeout_ms) / 1000
         started = time.monotonic()
         # True once a complete upstream response has been read and examined, which is what
@@ -715,6 +1047,8 @@ class Gateway:
                         await response.prepare(request)
                         async for chunk in upstream.content.iter_any():
                             observer.feed(chunk)
+                            if observer.first_output_ms is not None:
+                                self.note_first_output(request, observer.first_output_ms)
                             safe = guard.feed(chunk)
                             if safe:
                                 await response.write(safe)
@@ -761,6 +1095,7 @@ class Gateway:
                             },
                         )
                         record_usage(receipt, native.get("usage"), True)
+                        self.note_first_output(request, int((time.monotonic() - started) * 1000))
                     receipt["outcome"], reason = "succeeded", "completed"
                     return response
         except asyncio.CancelledError:
@@ -775,6 +1110,7 @@ class Gateway:
                 record_usage(receipt, observer.native_usage, False)
             if response is not None and response.prepared:
                 # Do not fabricate [DONE] or close a truncated SSE body as a successful HTTP message.
+                downstream_broken = True
                 if request.transport:
                     request.transport.abort()
                 return response
@@ -798,6 +1134,10 @@ class Gateway:
                 receipt["outcome"],
                 elapsed_ms,
             )
+            # Recorded after the authoritative receipt, from the reason the transfer already
+            # produced: the runtime event reports the attempt, it never decides it.
+            outcome, code = self.attempt_terminal(reason)
+            self.finish_attempt(request, outcome, code, elapsed_ms, downstream_broken)
 
 
 def grant_identity(grant):
@@ -839,24 +1179,73 @@ def native_route(request):
     )
 
 
+def provenance_event(exc):
+    """The terminal event of a refusal, chosen by the refusal's own fixed code."""
+    if exc.code == "unauthorized":
+        return "request.unauthenticated"
+    if exc.code == "forbidden":
+        return "request.revoked"
+    return "request.rejected"
+
+
+def proven_code(exc):
+    """A refusal's own code when it is a registered log code, otherwise the fixed fallback."""
+    if exc.code in observation_events.ERROR_CODES:
+        return exc.code
+    return observation_events.UNKNOWN_ERROR_CODE
+
+
 @web.middleware
 async def errors(request, handler):
     request[REQUEST_ID] = str(uuid.uuid4())
+    gateway = request.app.get(GATEWAY)
+    # The two read-only probes are structurally excluded from observation here, so no later
+    # change can accidentally give them a correlation, a business event or a success record.
+    probe = request.path in PROBE_PATHS
     native = native_route(request)
     contract = NATIVE_CONTRACT if native else None
+    token = None
+    if not probe and gateway is not None and gateway.observability is not None:
+        # The correlation of this request. A missing, malformed or unknown header produces a
+        # fresh value and the presented string is never kept, echoed, logged or forwarded.
+        token = bind_correlation(request.headers.get(CORRELATION_HEADER))
     try:
-        return await handler(request)
+        response = await handler(request)
     except Rejected as exc:
+        if not probe and gateway is not None:
+            gateway.record_event(request, provenance_event(exc), error_code=proven_code(exc))
         return error_response(exc, request[REQUEST_ID], contract)
     except web.HTTPException as exc:
+        if not probe and gateway is not None:
+            if exc.status in ROUTE_UNMATCHED_STATUSES:
+                # A path or method this gateway never published: no attempt, no forward, no
+                # capacity was consumed, so the end of the request is an unmatched route.
+                gateway.record_event(request, "request.route_unmatched", error_code="not_found")
+            else:
+                gateway.record_event(
+                    request,
+                    "request.rejected",
+                    error_code=HTTP_STATUS_CODES.get(
+                        exc.status, observation_events.UNKNOWN_ERROR_CODE
+                    ),
+                )
         if native:
             # The published native table has no 404/405 pair; an unknown method or path on
             # a native interface stays a fixed not_found rather than an unmapped status.
             return error_response(Rejected("not_found", 404), request[REQUEST_ID], contract)
         return error_response(Rejected("not_found", exc.status), request[REQUEST_ID])
     except asyncio.CancelledError:
+        if not probe and gateway is not None:
+            gateway.record_event(request, "request.cancelled")
         raise
     except Exception:
+        if not probe and gateway is not None:
+            gateway.record_event(
+                request,
+                "request.finished",
+                outcome="unknown",
+                error_code=observation_events.UNKNOWN_ERROR_CODE,
+            )
         # No exception text/stack/request URL: third-party errors can contain credentials or body.
         LOG.error("gateway_internal_error")
         stream = request.get(STREAM_RESPONSE)
@@ -873,6 +1262,44 @@ async def errors(request, handler):
         return error_response(
             Rejected("dependency_unavailable", 503), request[REQUEST_ID], contract
         )
+    finally:
+        if token is not None:
+            reset_correlation(token)
+    if not probe and gateway is not None:
+        # A route that answered without raising and without forwarding anything ends here.
+        # A forwarded attempt already recorded its own terminal in the transfer path.
+        if response.status >= 400:
+            gateway.record_event(
+                request,
+                "request.rejected",
+                error_code=HTTP_STATUS_CODES.get(
+                    response.status, observation_events.UNKNOWN_ERROR_CODE
+                ),
+            )
+        else:
+            gateway.record_event(request, "request.finished", outcome="succeeded")
+    return response
+
+
+def observed(handler):
+    """Record the entry of one published business route, then run it unchanged.
+
+    This is assembly, not domain behaviour: the wrapper adds no decision and observes the path
+    the router already selected. The two probes are never wrapped, which is what makes "a probe
+    records nothing" structural rather than remembered.
+    """
+
+    async def wrapper(request):
+        gateway = request.app[GATEWAY]
+        gateway.record_event(request, "request.accepted")
+        request[WORK_STARTED] = time.monotonic()
+        token = _CURRENT_REQUEST.set(request)
+        try:
+            return await handler(request)
+        finally:
+            _CURRENT_REQUEST.reset(token)
+
+    return wrapper
 
 
 GATEWAY = web.AppKey("gateway", Gateway)
@@ -925,8 +1352,31 @@ class _CounterSlot:
         self.gateway.provider_active[self.provider_id] -= 1
 
 
-def create_app(settings):
+def closed_probe(status, checks):
+    """One closed probe answer: ``status`` and ``checks`` are the only fields either probe has."""
+    body = {
+        "status": probe_health.NOT_READY,
+        "service": probe_health.SERVICE,
+        "checks": checks,
+    }
+    return web.Response(
+        body=probe_health.encode_body(body),
+        status=status,
+        content_type=JSON_TYPE,
+        headers=dict(NO_STORE),
+    )
+
+
+def create_app(settings, observability=None):
     settings.validate()
+    contract = None
+    if settings.diagnostics_contract_directory is not None:
+        # Read-only load with manifest hash verification: a package that disagrees with its own
+        # manifest, or a closed record that disagrees with this product's static catalogue,
+        # stops the start instead of producing records nobody agreed on.
+        contract = load_contract(settings.diagnostics_contract_directory)
+        if observability is not None:
+            observability.contract = contract
     contracts = Contracts(
         settings.contract_directory,
         settings.native_contract_directory if settings.native_enabled else None,
@@ -971,11 +1421,40 @@ def create_app(settings):
                 auto_decompress=False,
                 cookie_jar=aiohttp.DummyCookieJar(),
             ) as session:
-                app[GATEWAY] = Gateway(
-                    settings, contracts, targets, session, diagnostics, scheduler
+                gateway = Gateway(
+                    settings, contracts, targets, session, diagnostics, scheduler, observability
                 )
+                gateway.contract_verified = contract is not None
+                app[GATEWAY] = gateway
+                if observability is not None:
+                    # The sink is opened and started here, by the app lifecycle, so the file
+                    # handle and the writer task belong to a running server rather than to a
+                    # module-level object.
+                    try:
+                        await observability.start()
+                        observability.event("runtime.starting")
+                        # The first readiness this process determines for itself. It is not a
+                        # probe, and it is what makes a later change a change.
+                        gateway.sync_readiness()
+                        observability.event("runtime.started")
+                    except Exception:
+                        # Nothing is serving. The failure is recorded on whatever channel is
+                        # still usable -- the sink when it opened, the fixed emergency channel
+                        # when it did not -- and the start is abandoned rather than degraded
+                        # into a runtime that silently logs nothing.
+                        observability.event("runtime.startup_failed", error_code="internal_error")
+                        raise
                 yield
         finally:
+            gateway = app.get(GATEWAY)
+            if gateway is not None:
+                gateway.closed = True
+            if observability is not None:
+                # A bounded graceful teardown, recorded before the sink closes so the last
+                # events of this process are on durable storage.
+                observability.event("runtime.stopping")
+                observability.event("runtime.stopped")
+                await observability.shutdown()
             diagnostics.close()
 
     async def chat(request):
@@ -998,28 +1477,72 @@ def create_app(settings):
 
     async def unsupported(request):
         request.app[GATEWAY].authenticate(request)
+        # The terminal is recorded here, with this refusal's own code, before the middleware's
+        # status-based fallback could name a different one.
+        request.app[GATEWAY].record_event(request, "request.rejected", error_code="invalid_input")
         return error_response(Rejected("invalid_input", 501), request[REQUEST_ID])
 
     async def native_disabled(request):
         request.app[GATEWAY].authenticate(request)
+        request.app[GATEWAY].record_event(
+            request, "request.rejected", error_code="unsupported_operation"
+        )
         return error_response(
             Rejected("unsupported_operation", 501), request[REQUEST_ID], NATIVE_CONTRACT
         )
 
+    async def live(request):
+        """Liveness is this process being able to answer: no dependency is consulted."""
+        return web.Response(
+            body=probe_health.encode_body(probe_health.LIVE_BODY),
+            status=probe_health.STATUS_OK,
+            content_type=JSON_TYPE,
+            headers=dict(NO_STORE),
+        )
+
+    async def ready(request):
+        """Readiness: eight checks, no write, no file, no network, no event of its own."""
+        observation = request.app[GATEWAY].observability
+        if observation is None:
+            # No adapter is assembled, so nothing about readiness can be verified here. The
+            # answer is the closed body with every check unverified, never a hopeful "ready".
+            return closed_probe(
+                probe_health.STATUS_UNAVAILABLE,
+                dict.fromkeys(probe_health.CHECK_NAMES, "not_verified"),
+            )
+        status = probe_health.probe_authorization(
+            request.headers.get("Authorization"), observation.probe_token()
+        )
+        if status != probe_health.STATUS_OK:
+            # A probe that is not authorized learns the closed body and nothing else: no check
+            # name is ever distinguished for a caller that cannot read readiness.
+            return closed_probe(status, dict.fromkeys(probe_health.CHECK_NAMES, "not_verified"))
+        status, body = observation.probe.evaluate(request.app[GATEWAY].check_providers())
+        return web.Response(
+            body=probe_health.encode_body(body),
+            status=status,
+            content_type=JSON_TYPE,
+            headers=dict(NO_STORE),
+        )
+
     app.cleanup_ctx.append(resources)
-    app.router.add_post("/v1/chat/completions", chat)
-    app.router.add_get("/internal/v1/model-requests/{request_id}", receipt)
-    app.router.add_get(USAGE_PATH, usage)
+    app.router.add_post("/v1/chat/completions", observed(chat))
+    app.router.add_get("/internal/v1/model-requests/{request_id}", observed(receipt))
+    app.router.add_get(USAGE_PATH, observed(usage))
+    # Neither probe is wrapped: a probe writes no event, takes no capacity and touches no
+    # dependency, and that is a property of the wiring rather than of the handler body.
+    app.router.add_get(LIVE_PATH, live)
+    app.router.add_get(READY_PATH, ready)
     for path in ("/v1/messages", "/v1/embeddings"):
-        app.router.add_route("*", path, unsupported)
+        app.router.add_route("*", path, observed(unsupported))
     if settings.native_enabled:
-        app.router.add_post(NATIVE_ROUTE_PATH, native_responses)
-        app.router.add_get(NATIVE_RECEIPT_PATH + "{request_id}", native_receipt)
-        app.router.add_get(NATIVE_USAGE_PATH, native_usage)
+        app.router.add_post(NATIVE_ROUTE_PATH, observed(native_responses))
+        app.router.add_get(NATIVE_RECEIPT_PATH + "{request_id}", observed(native_receipt))
+        app.router.add_get(NATIVE_USAGE_PATH, observed(native_usage))
     else:
         # Native stays closed until a deployment explicitly enables it.
-        app.router.add_route("*", NATIVE_ROUTE_PATH, native_disabled)
-        app.router.add_route("*", NATIVE_USAGE_PATH, native_disabled)
+        app.router.add_route("*", NATIVE_ROUTE_PATH, observed(native_disabled))
+        app.router.add_route("*", NATIVE_USAGE_PATH, observed(native_disabled))
     return app
 
 
@@ -1038,4 +1561,9 @@ def load_settings(raw):
         data["workload_bindings"] = Classification(
             bindings.get("bindings") or {}, bindings.get("default_class", "interactive")
         )
+    # The observation block is optional and heavily defaulted: an existing document keeps the
+    # previous behaviour (no runtime event, no health surface) without being edited, and a
+    # document that carries the block is validated by ``Settings.validate`` before the bind.
+    if data.get("observability") is not None:
+        data["observability"] = ObservabilitySettings(**data["observability"])
     return Settings(**data)

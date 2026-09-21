@@ -199,6 +199,7 @@ async def send_responses(
     secrets=(),
     validate_response=None,
     validate_receipt=None,
+    on_first_output=None,
 ):
     """One HTTP attempt with asynchronous sink/backpressure and native-ledger observation.
 
@@ -218,12 +219,29 @@ async def send_responses(
     attempt. An observation shortfall is different: once the upstream response has been
     received in full, the observer may only downgrade the recorded outcome to unknown, so
     the raw bytes are still delivered unchanged.
+
+    ``on_first_output`` is a fixed, optional observation seam: it is called at most once, at
+    the instant this attempt first produced model output. It receives no chunk, no count and no
+    content, and it cannot influence a byte of the transfer -- a failure inside it is confined
+    to the side channel.
     """
     if timeout <= 0 or min(max_request_bytes, max_response_bytes) <= 0:
         raise ValueError("positive transport limits required")
     if len(payload) > max_request_bytes:
         raise Rejected("payload_too_large", 413)
     body = validate_request(payload)
+    first_output = [on_first_output is not None]
+
+    def note_output():
+        """Report the first observed output once; never participates in the transfer."""
+        if not first_output[0]:
+            return
+        first_output[0] = False
+        try:
+            on_first_output()
+        except Exception:
+            return
+
     if (
         receipt.get("protocol") != PROTOCOL
         or receipt.get("contract") != NATIVE_CONTRACT
@@ -286,6 +304,8 @@ async def send_responses(
                     await start_response(upstream.status, "text/event-stream")
                     async for chunk in upstream.content.iter_any():
                         observer.feed(chunk)
+                        if observer.first_output_ms is not None:
+                            note_output()
                         safe = guard.feed(chunk)
                         if safe:
                             await write(safe)
@@ -319,6 +339,8 @@ async def send_responses(
                         pass
                     await start_response(upstream.status, "application/json")
                     await write(raw)
+                    # A single JSON body is its own first output.
+                    note_output()
                 if observer.complete:
                     complete = True
                     receipt["outcome"] = TERMINALS[observer.status]
