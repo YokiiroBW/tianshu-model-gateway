@@ -64,7 +64,10 @@ class ContainerDefinitionTests(unittest.TestCase):
         bases = self.instructions("FROM")
         self.assertEqual(len(bases), 2, bases)
         for line in bases:
-            self.assertRegex(line, r"^FROM python:3\.12\.\d+-slim-bookworm( AS \w+)?$")
+            self.assertRegex(
+                line,
+                r"^FROM --platform=linux/amd64 python:3\.12\.\d+-slim-bookworm@sha256:[a-f0-9]{64}( AS \w+)?$",
+            )
             self.assertNotIn("latest", line)
 
     def test_the_locked_dependency_set_is_installed_with_locked_resolution(self):

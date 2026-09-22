@@ -1,0 +1,37 @@
+{
+  "packages": {
+    "aiohappyeyeballs": "2.7.1",
+    "aiohttp": "3.14.1",
+    "aiosignal": "1.4.0",
+    "attrs": "26.1.0",
+    "frozenlist": "1.8.0",
+    "idna": "3.19",
+    "jsonschema": "4.26.0",
+    "jsonschema-specifications": "2025.9.1",
+    "multidict": "6.8.0",
+    "propcache": "0.5.2",
+    "referencing": "0.37.0",
+    "rpds-py": "2026.6.3",
+    "tianshu-model-gateway": "0.1.0",
+    "typing-extensions": "4.16.0",
+    "yarl": "1.24.5"
+  },
+  "module": "installed runtime/Lib/site-packages/tianshu_gateway/__init__.py (Windows)",
+  "linux_image_executed": false,
+  "steps": [
+    "copy fixed build inputs",
+    "install pinned build tools into a new build venv",
+    "uv sync --locked dependencies into a separate new runtime venv",
+    "build and install a noneditable product wheel",
+    "check packages, imports and CLI"
+  ],
+  "python": "3.12.14 (main, Aug 25 2026, 14:01:42) [MSC v.1944 64 bit (AMD64)]",
+  "wheel_sha256": "cf399f7f57ae66f5b7bc41be56760a6a2629a5841976da5599e64a58677107c6",
+  "input_sha256": {
+    "pyproject.toml": "95e0547ce48625d7297f526e7bfeb08bf74b1b2901da94fbfab19bac3f19a934",
+    "uv.lock": "56de5d63a49b0f4544ca3926eadfab4ff6b8f5b7506f976cb9b8832002700e29",
+    "Dockerfile": "aa0fd280456b64080afb6e020b44a8c7107dc234915e9a15dd3ea7b3db85f27d",
+    "scripts/build/tools.lock": "9bb0f3be547b2ba928b3b8a876ecb90390f08e172a0f78d34f539c7052572810"
+  },
+  "note": "Fresh Windows runtime, no pip/uv/setuptools/wheel/ruff; not a Linux image. Input hashes describe tested worktree raw bytes."
+}

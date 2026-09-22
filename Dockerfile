@@ -15,27 +15,32 @@
 # docs/deployment.md and docs/handoffs/TS-103.md for the exact unverified items.
 
 # --- stage 1: resolve and install the locked dependency set -----------------------------
-FROM python:3.12.12-slim-bookworm AS builder
+FROM --platform=linux/amd64 python:3.12.12-slim-bookworm@sha256:2986c55feb36e6cae00fa1fefb454283e4b33f35e75ff8bdd123b134130be301 AS builder
 
 # The uv version is pinned so the resolver that produced uv.lock is the resolver that consumes
 # it. `--locked` then makes the build fail rather than silently updating the lock.
-ARG UV_VERSION=0.9.5
 ENV UV_PROJECT_ENVIRONMENT=/opt/tianshu-venv \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
     UV_NO_CACHE=1
 
-RUN pip install --no-cache-dir "uv==${UV_VERSION}"
+COPY scripts/build/tools.lock ./tools.lock
+RUN pip install --no-cache-dir --no-deps -r tools.lock
 
 WORKDIR /build
 # Only what the resolution needs. The project is installed from source with --no-editable, so
 # the runtime stage carries an installed package rather than a source tree to import from.
 COPY pyproject.toml uv.lock ./
 COPY src/ ./src/
-RUN python -m uv sync --locked --no-dev --no-editable --python /usr/local/bin/python3.12
+# Dependencies use the unchanged uv.lock. Build the project separately with the pinned backend.
+RUN python -m uv sync --locked --no-dev --no-editable --no-install-project --no-build --python /usr/local/bin/python3.12 \
+    && python -m pip wheel --no-deps --no-build-isolation --wheel-dir /wheels . \
+    && python -m uv pip install --python /opt/tianshu-venv/bin/python --no-deps /wheels/*.whl \
+    && python -m uv pip check --python /opt/tianshu-venv/bin/python \
+    && /opt/tianshu-venv/bin/python -I -m tianshu_gateway --help
 
 # --- stage 2: the runtime image ---------------------------------------------------------
-FROM python:3.12.12-slim-bookworm AS runtime
+FROM --platform=linux/amd64 python:3.12.12-slim-bookworm@sha256:2986c55feb36e6cae00fa1fefb454283e4b33f35e75ff8bdd123b134130be301 AS runtime
 
 # No build toolchain, no shell utilities for debugging, no package manager cache: the runtime
 # stage is the interpreter plus the installed package plus the liveness check.
@@ -78,5 +83,5 @@ STOPSIGNAL SIGTERM
 
 # The server refuses to start without --settings and without TLS material; there is no
 # implicit configuration to fall back on and no HTTP mode in this image.
-ENTRYPOINT ["python", "-m", "tianshu_gateway"]
+ENTRYPOINT ["python", "-I", "-m", "tianshu_gateway"]
 CMD ["--settings", "/etc/tianshu/settings.json", "--host", "0.0.0.0", "--port", "8443", "--tls-cert", "/etc/tianshu/tls/server.crt", "--tls-key", "/etc/tianshu/tls/server.key"]

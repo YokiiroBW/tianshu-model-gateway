@@ -114,3 +114,43 @@ python -m tianshu_gateway --settings /etc/tianshu/settings.json \
 4. **平台生产者侧未适配**：网关会向已登记的内部平台快照调用附带 `X-Tianshu-Correlation-Id`，平台生产者需要接受或忽略该头；这属于跨产品依赖，不在本卡内修改。
 5. **联合验收未完成**：`contracts/diagnostics/v1` 仍为 `development_frozen_pending_joint_acceptance`；本卡不代替协调者的联合验收结论。
 6. **无后台周期任务**：网关没有周期性后台工作，因此“后台周期实际工作开始结束”一行在合同映射中记为“不适用”，以源码与事件目录为证据，不用事件伪造。
+
+## 8. TS-112 固定镜像输入（2026-09-22）
+
+本节覆盖旧构建说明；不改变部署授权。保留Python3.12.12-slim-bookworm，builder/runtime
+都绑定linux/amd64官方子manifest `sha256:2986c55feb36e6cae00fa1fefb454283e4b33f35e75ff8bdd123b134130be301`。
+已通过Docker Registry读取并核对index/manifest/config摘要、架构与版本，记录
+`scripts/build/base-images.json`；[官方Python镜像](https://hub.docker.com/_/python)。没有拉取镜像层。
+
+`pyproject.toml`、`uv.lock`及业务源码不变。`scripts/build/tools.lock`固定uv0.9.5、setuptools80.9.0、wheel0.45.1。
+构建阶段先 `uv sync --locked --no-dev --no-editable --no-install-project --no-build` 安装完整运行依赖，
+再用已固定后端关闭构建隔离生成产品wheel，并以--no-deps安装进运行venv；uv pip check、隔离module help失败即阻断。
+源码安装与依赖解析分开，不需要修改项目manifest来固定构建工具；runtime只复制独立venv与健康检查脚本。
+运行包为14个第三方依赖+产品=15，不带pip/uv/setuptools/wheel/ruff；系统Python镜像自带的pip不在该运行venv内。
+
+复核入口使用Python3.12，scope须为本产品.runtime下新目录；不复用作者/测试环境，默认plan：
+
+```text
+python scripts/build/check_install.py --scope .runtime/ts112-install-new
+python scripts/build/check_install.py --scope .runtime/ts112-install-new --execute
+```
+
+实际Windows Python3.12.14执行通过：uv锁安装、非editable wheel、包完整集合/导入来源、uv pip check、
+module/console与usage-report/log-recovery-check共4help；见`scripts/build/local-install-evidence.json`。
+独立4个scope/输入边界和10个既有镜像定义测试通过0skip。未重跑无变化业务或TLS测试。
+14个CPython3.12的Linux x86_64适配wheel已实际下载并逐一与uv.lock哈希核对，见
+`scripts/build/linux-wheel-evidence.json`；只是下载可用性，未执行Linux二进制。它们也覆盖平台相同14包版本，
+下载输入来自固定平台9b45d813的runtime.lock；不是读取另一个活动检出。
+
+协调在新的合成scope内、确认本地Docker上下文后执行（本轮未执行）：
+
+```sh
+docker build --platform linux/amd64 --pull --tag tianshu-model-gateway:ts112-review <verified-context>
+docker image inspect tianshu-model-gateway:ts112-review --format '{{.Os}}/{{.Architecture}} {{.Id}} {{.Config.User}}'
+docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 256m --cpus 1 tianshu-model-gateway:ts112-review --help
+docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 256m --cpus 1 --entrypoint python tianshu-model-gateway:ts112-review -I -c 'import importlib.metadata as m; print(sorted((d.metadata["Name"],d.version) for d in m.distributions()))'
+```
+
+本地构建image Id不是registry digest。合同/设置/TLS/来源ref在运行时由DEP-G装配，原字节冻结合同由协调根读取验核，
+不能用占位来源或旧Git合同代替；此入口不初始化授权、不启动模型、不挂载真实数据。完整ready/健康/UID/GID/卷权限/
+SIGTERM/续期容器接线/Linux新装/NAS仍未执行，本地Python3.12.14不能代替镜像3.12.12验证。

@@ -31,3 +31,35 @@ dist
 *.sqlite-shm
 *.log
 *.jsonl
+
+# Explicitly exclude nested state and key material from the context.
+**/__pycache__
+**/*.egg-info
+**/*.py[cod]
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.env
+*.db
+settings.json
+
+# Preserve build-specific inputs, even if a broader build rule is added later.
+!scripts/build/
+!scripts/build/**
+
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/*.pfx
+**/*.env
+**/*.db
+**/.env
+**/.env.*
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/*.jsonl
+**/*.log
