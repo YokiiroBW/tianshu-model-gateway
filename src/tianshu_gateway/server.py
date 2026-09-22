@@ -53,6 +53,11 @@ from .observability import (
 from .observability import events as observation_events
 from .observability import health as probe_health
 from .observability.events import load_contract
+from .origin_renewal import (
+    CurrentCache,
+    OriginRenewal,
+    validate_settings as validate_origin_renewal,
+)
 from .responses import send_responses, validate_request
 from .routing import PROTOCOL, SecretGuard, StreamObserver, apply_fields, prepare, record_usage
 from .scheduler import AdmissionRefused, BoundedAdmissionScheduler, bind
@@ -179,6 +184,7 @@ class Settings:
     # health surface is configured, so an old document still starts unchanged.
     diagnostics_contract_directory: str | None = None
     observability: ObservabilitySettings | None = None
+    platform_origin_renewal: bool = False
 
     @property
     def policy(self):
@@ -190,6 +196,7 @@ class Settings:
         return self.workload_bindings or Classification()
 
     def validate(self):
+        validate_origin_renewal(self.platform_origin_renewal, self.platform_base_url)
         if not self.clients and not self.native_clients:
             raise ValueError("authenticated client registration required")
         if (
@@ -283,6 +290,18 @@ class Gateway:
         # to read a row, a statement or an exception to observe one.
         self.diagnostics.observe(self.receipt_failure)
         self.secrets = EnvSecrets(settings.secret_references)
+        self.origin_renewal = (
+            OriginRenewal(
+                session,
+                targets,
+                self.secrets,
+                settings.platform_base_url,
+                settings.platform_credential_ref,
+                settings.platform_origin_env,
+            )
+            if settings.platform_origin_renewal
+            else None
+        )
         self.cache = ConfigCache(
             HttpConfigSource(
                 session,
@@ -320,6 +339,10 @@ class Gateway:
                 diagnostics,
                 settings.config_refresh_seconds,
             )
+        if self.origin_renewal is not None:
+            self.cache = CurrentCache(self.cache, self.origin_renewal)
+            if self.native_cache is not None:
+                self.native_cache = CurrentCache(self.native_cache, self.origin_renewal)
         self.active = 0
         self.provider_active = {}
 
@@ -514,6 +537,8 @@ class Gateway:
             for grant in (*self.settings.clients, *self.settings.native_clients):
                 self.secrets.resolve(grant.credential_ref)
             self.secrets.resolve(self.settings.platform_credential_ref)
+            if self.origin_renewal is not None:
+                self.origin_renewal.check()
         except Rejected:
             return "failed"
         return "ok"
@@ -1430,25 +1455,34 @@ def create_app(settings, observability=None):
                 )
                 gateway.contract_verified = contract is not None
                 app[GATEWAY] = gateway
-                if observability is not None:
-                    # The sink is opened and started here, by the app lifecycle, so the file
-                    # handle and the writer task belong to a running server rather than to a
-                    # module-level object.
-                    try:
+                try:
+                    if observability is not None:
+                        # The lifecycle owns the sink; a successful origin check must precede
+                        # runtime.started so an invalid bootstrap cannot be logged as started.
                         await observability.start()
                         observability.event("runtime.starting")
+                    if gateway.origin_renewal is not None:
+                        await gateway.origin_renewal.start()
+                    if observability is not None:
                         # The first readiness this process determines for itself. It is not a
                         # probe, and it is what makes a later change a change.
                         gateway.sync_readiness()
                         observability.event("runtime.started")
-                    except Exception:
+                except BaseException:
+                    if observability is not None:
                         # Nothing is serving. The failure is recorded on whatever channel is
                         # still usable -- the sink when it opened, the fixed emergency channel
                         # when it did not -- and the start is abandoned rather than degraded
                         # into a runtime that silently logs nothing.
                         observability.event("runtime.startup_failed", error_code="internal_error")
-                        raise
-                yield
+                    if gateway.origin_renewal is not None:
+                        await gateway.origin_renewal.close()
+                    raise
+                try:
+                    yield
+                finally:
+                    if gateway.origin_renewal is not None:
+                        await gateway.origin_renewal.close()
         finally:
             gateway = app.get(GATEWAY)
             if gateway is not None:
