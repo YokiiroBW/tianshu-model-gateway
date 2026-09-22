@@ -36,12 +36,12 @@ def utc(value):
 
 
 class OriginWireTests(unittest.TestCase):
-    def test_pinned_candidate_examples_and_strict_scalar_types(self):
+    def test_pinned_frozen_contract_examples_and_strict_scalar_types(self):
         root = WORKSPACE / "contracts/model-origin-renewal/v1"
         raw = (root / "manifest.json").read_bytes()
         self.assertEqual(
             hashlib.sha256(raw).hexdigest(),
-            "9db7a18ba29ba542d7cdbf2951912520fe83d801f09ab544ba9c9208bca04b55",
+            "c5017724187c1386b647fcc5b41ab3cb1702f27d6192f3a87fcefb23e7a5a61c",
         )
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)
