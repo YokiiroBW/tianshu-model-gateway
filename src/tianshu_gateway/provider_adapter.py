@@ -11,6 +11,7 @@ import json
 import socket
 import ssl
 from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -111,6 +112,36 @@ class OpenAIAdapter:
         if not 0 < timeout_seconds <= 60 or not 1 <= response_limit <= 1_048_576:
             raise ValueError("bounded execution required")
         self.timeout_seconds, self.response_limit = timeout_seconds, response_limit
+
+    @asynccontextmanager
+    async def runtime_session(self, context):
+        """One validated DNS set and one non-retrying session for the existing route path."""
+        base, host, port = checked_base(context.base_url, "public")
+        if context.protocol != "openai-chat-completions" or not context.api_key:
+            raise ProviderFailure("invalid_request")
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                addresses = tuple(await self.resolver(host, port))
+            if not addresses or not all(self.policy.permits(ip, "public") for ip in addresses):
+                raise ProviderFailure("target_forbidden")
+            targets = RegisteredTargets(
+                [{"base_url": base, "addresses": addresses, "allow_private_http": False}]
+            )
+            connector = aiohttp.TCPConnector(
+                resolver=targets, use_dns_cache=False, force_close=True, ssl=self.tls_context
+            )
+            async with aiohttp.ClientSession(
+                connector=connector,
+                trust_env=False,
+                cookie_jar=aiohttp.DummyCookieJar(),
+                auto_decompress=False,
+            ) as session:
+                session._retry_connection = False
+                yield session
+        except asyncio.CancelledError:
+            raise
+        except (aiohttp.ClientError, OSError, ValueError, TimeoutError):
+            raise ProviderFailure("upstream_failed") from None
 
     async def models(self, context, *, connection_type="public"):
         document = await self._request(context, "models", None, connection_type)

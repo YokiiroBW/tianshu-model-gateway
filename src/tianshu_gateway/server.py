@@ -6,7 +6,7 @@ import logging
 import time
 import uuid
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import aiohttp
 from aiohttp import web
@@ -53,6 +53,8 @@ from .observability import (
 from .observability import events as observation_events
 from .observability import health as probe_health
 from .observability.events import load_contract
+from .provider_adapter import ExecutionContext, OpenAIAdapter, ProviderFailure
+from .provider_runtime import ProviderRuntimeSource
 from .origin_renewal import (
     CurrentCache,
     OriginRenewal,
@@ -185,6 +187,8 @@ class Settings:
     diagnostics_contract_directory: str | None = None
     observability: ObservabilitySettings | None = None
     platform_origin_renewal: bool = False
+    provider_management_credential_ref: str | None = None
+    provider_self_service: bool = False
 
     @property
     def policy(self):
@@ -196,6 +200,18 @@ class Settings:
         return self.workload_bindings or Classification()
 
     def validate(self):
+        if type(self.provider_self_service) is not bool:
+            raise ValueError("provider self service flag required")
+        if self.provider_management_credential_ref is not None:
+            ref = self.provider_management_credential_ref
+            if (
+                not isinstance(ref, str)
+                or ref not in self.secret_references
+                or ref == self.platform_credential_ref
+                or ref in {client.credential_ref for client in self.clients}
+                or ref in {client.credential_ref for client in self.native_clients}
+            ):
+                raise ValueError("dedicated provider management credential required")
         validate_origin_renewal(self.platform_origin_renewal, self.platform_base_url)
         if not self.clients and not self.native_clients:
             raise ValueError("authenticated client registration required")
@@ -345,6 +361,106 @@ class Gateway:
                 self.native_cache = CurrentCache(self.native_cache, self.origin_renewal)
         self.active = 0
         self.provider_active = {}
+        self.provider_adapter = OpenAIAdapter()
+        self.dynamic_source = (
+            ProviderRuntimeSource(
+                session, settings.platform_base_url, self.secrets, settings.platform_credential_ref
+            )
+            if settings.provider_self_service
+            else None
+        )
+
+    async def provider_management(self, request):
+        """One private platform-only operation; a browser token never opens this port."""
+        ref = self.settings.provider_management_credential_ref
+        if ref is None:
+            raise Rejected("not_found", 404)
+        token = request.headers.get("Authorization", "")
+        try:
+            expected = self.secrets.resolve(ref)
+        except Rejected:
+            raise Rejected("dependency_unavailable", 503) from None
+        if not hmac.compare_digest(token.encode(), ("Bearer " + expected).encode()):
+            raise Rejected("unauthorized", 401)
+        if request.content_type != "application/json" or request.query_string:
+            raise Rejected()
+        raw = await read_limited(request.content, 12288)
+        body = loads(raw)
+        if not isinstance(body, dict) or set(body) != {
+            "provider_id",
+            "revision",
+            "protocol",
+            "base_url",
+            "model_id",
+            "api_key",
+        }:
+            raise Rejected()
+        if (
+            not isinstance(body["provider_id"], str)
+            or not body["provider_id"]
+            or type(body["revision"]) is not int
+            or body["revision"] < 1
+        ):
+            raise Rejected()
+        context = ExecutionContext(**body)
+        operation = request.match_info["operation"]
+        try:
+            if operation == "models":
+                result = {"models": list(await self.provider_adapter.models(context))}
+            elif operation == "test":
+                verdict = await self.provider_adapter.test_reply(context)
+                if not verdict["reply_verified"]:
+                    raise ProviderFailure("invalid_response", "unknown")
+                result = {"outcome": "succeeded"}
+            else:
+                raise Rejected("not_found", 404)
+        except ProviderFailure as failure:
+            mapping = {
+                "invalid_credential": ("authentication_failed", 502),
+                "models_unsupported": ("enumeration_unsupported", 502),
+                "endpoint_not_found": ("endpoint_failed", 502),
+                "model_not_found": ("model_not_found", 502),
+                "timeout": ("timed_out", 504),
+                "upstream_failed": ("connection_failed", 503),
+            }
+            code, status = mapping.get(failure.code, ("upstream_invalid", 502))
+            raise Rejected(code, status, failure.outcome) from None
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
+
+    def dynamic_config(self, source):
+        """Project an authenticated exact binding into the existing routing pipeline."""
+        self.contracts.validate("common#id", source["provider_id"])
+        if (
+            source["protocol"] != "openai-chat-completions"
+            or not source["model_id"]
+            or len(source["model_id"]) > 256
+        ):
+            raise Rejected("dependency_unavailable", 503)
+        provider = {
+            "provider_id": source["provider_id"],
+            "base_url": source["base_url"],
+            "credential_ref": "provider-managed",
+            "credential_namespace": "provider-managed",
+            "protocol": source["protocol"],
+            "model_id": source["model_id"],
+            "capability_verification": "provider_test",
+            "verified_capabilities": ["text"],
+            "model_policy": {"mode": "preserve_client", "fields": {}},
+            "reasoning_policy": {"mode": "preserve_client", "fields": {}},
+        }
+        return {
+            "config_version": source["config_version"],
+            "providers": [provider],
+            "bindings": [
+                {
+                    "workload": "companion.text",
+                    "provider_id": source["provider_id"],
+                    "model_id": source["model_id"],
+                    "timeout_ms": 30000,
+                    "fallback": "disabled",
+                }
+            ],
+        }
 
     @property
     def idle(self):
@@ -713,7 +829,9 @@ class Gateway:
         self.contracts.validate("model#route_context", context)
         if any(secret in context["request_id"] for secret in self.secrets.known_values()):
             raise Rejected()
-        if context["config_version"] not in (grant.config_version, *grant.allowed_versions):
+        if context["config_version"] not in (grant.config_version, *grant.allowed_versions) and (
+            self.dynamic_source is None or not grant.internal or grant.service != "companion"
+        ):
             raise Rejected("forbidden", 403)
         return context["request_id"], context["config_version"], context["turn_id"]
 
@@ -779,12 +897,25 @@ class Gateway:
             raise Rejected("timeout", 408) from None
         body = loads(raw)
         self.contracts.validate("model#native_request", body)
-        config = await self.cache.get(version)
-        effective, provider, binding, receipt = prepare(
-            self.contracts, body, config, grant, request_id, grant.internal
+        dynamic = self.dynamic_source is not None and version not in (
+            grant.config_version,
+            *grant.allowed_versions,
         )
-        credential = self.secrets.resolve(provider["credential_ref"])
-        self.targets.check(provider["base_url"])
+        if dynamic:
+            source = await self.dynamic_source.fetch(version, turn_id, grant.service)
+            config = self.dynamic_config(source)
+            route_grant = replace(grant, provider_id=source["provider_id"])
+        else:
+            config = await self.cache.get(version)
+            route_grant = grant
+        effective, provider, binding, receipt = prepare(
+            self.contracts, body, config, route_grant, request_id, grant.internal
+        )
+        if dynamic:
+            credential = source["api_key"]
+        else:
+            credential = self.secrets.resolve(provider["credential_ref"])
+            self.targets.check(provider["base_url"])
         # One launch key per logical client call: a repeated request ID may not occupy a
         # second queue slot, and the key never leaves this attempt.
         slot = self.slot(
@@ -801,26 +932,63 @@ class Gateway:
                     raise Rejected("timeout", 408)
                 # Re-read from the pinned version, then re-authenticate the caller: an expired
                 # or revoked registration, or a withdrawn credential, must not reach upstream.
-                await self.cache.get(version)
-                credential = self.requeue_reverify(request, grant, False, provider)
-                secrets = self.secrets.known_values()
+                if dynamic:
+                    current_grant = self.authenticate(request)
+                    if grant_identity(current_grant) != grant_identity(grant):
+                        raise Rejected("unauthorized", 401)
+                    confirmed = await self.dynamic_source.fetch(version, turn_id, grant.service)
+                    if confirmed != source:
+                        raise Rejected("forbidden", 403)
+                    credential = confirmed["api_key"]
+                else:
+                    await self.cache.get(version)
+                    credential = self.requeue_reverify(request, grant, False, provider)
+                secrets = (
+                    [*self.secrets.known_values(), credential]
+                    if dynamic
+                    else self.secrets.known_values()
+                )
                 receipt = redact(receipt, secrets)
                 self.contracts.validate("model#route_receipt", receipt)
+
                 # The attempt that is about to cause a side effect is put on durable storage
                 # first, with no scheduler lock, no transaction and no forward write held. A
                 # record that is not durable refuses this new business before anything is sent:
                 # no ledger row exists yet and no upstream call is made, so nothing is retried
                 # and nothing already delivered is disturbed.
-                if not await self.begin_upstream(request):
-                    raise Rejected("dependency_unavailable", 503)
-                # A queued request is never recorded as forwarded: the ledger row is created
-                # after admission and only for an attempt that is about to be sent.
-                self.diagnostics.begin(receipt, turn_id)
-                request[FORWARD_STARTED] = True
-                payload = apply_fields(raw, effective, receipt["applied_policies"])
-                return await self.forward(
-                    request, payload, effective, provider, binding, credential, receipt, secrets
-                )
+                async def submit(session):
+                    if not await self.begin_upstream(request):
+                        raise Rejected("dependency_unavailable", 503)
+                    self.diagnostics.begin(receipt, turn_id)
+                    request[FORWARD_STARTED] = True
+                    payload = apply_fields(raw, effective, receipt["applied_policies"])
+                    return await self.forward(
+                        request,
+                        payload,
+                        effective,
+                        provider,
+                        binding,
+                        credential,
+                        receipt,
+                        secrets,
+                        session=session,
+                    )
+
+                if dynamic:
+                    context = ExecutionContext(
+                        source["provider_id"],
+                        source["provider_revision"],
+                        source["base_url"],
+                        credential,
+                        source["model_id"],
+                        source["protocol"],
+                    )
+                    async with self.provider_adapter.runtime_session(context) as dynamic_session:
+                        confirmed = await self.dynamic_source.fetch(version, turn_id, grant.service)
+                        if confirmed != source:
+                            raise Rejected("forbidden", 403)
+                        return await submit(dynamic_session)
+                return await submit(self.session)
         except AdmissionRefused as exc:
             raise Rejected(exc.reason, exc.status) from None
         except TimeoutError:
@@ -1006,7 +1174,17 @@ class Gateway:
         return response
 
     async def forward(
-        self, request, payload, body, provider, binding, credential, receipt, secrets
+        self,
+        request,
+        payload,
+        body,
+        provider,
+        binding,
+        credential,
+        receipt,
+        secrets,
+        *,
+        session=None,
     ):
         headers = {
             "Content-Type": "application/json",
@@ -1032,7 +1210,7 @@ class Gateway:
         try:
             # Includes reading and downstream backpressure; no retry or redirect middleware.
             async with asyncio.timeout(timeout):
-                async with self.session.post(
+                async with (session or self.session).post(
                     provider["base_url"] + "/chat/completions",
                     data=payload,
                     headers=headers,
@@ -1498,6 +1676,9 @@ def create_app(settings, observability=None):
     async def chat(request):
         return await request.app[GATEWAY].chat(request)
 
+    async def provider_management(request):
+        return await request.app[GATEWAY].provider_management(request)
+
     async def receipt(request):
         return await request.app[GATEWAY].receipt(request)
 
@@ -1565,6 +1746,10 @@ def create_app(settings, observability=None):
 
     app.cleanup_ctx.append(resources)
     app.router.add_post("/v1/chat/completions", observed(chat))
+    if settings.provider_management_credential_ref is not None:
+        app.router.add_post(
+            "/internal/v1/provider-self-service/{operation}", observed(provider_management)
+        )
     app.router.add_get("/internal/v1/model-requests/{request_id}", observed(receipt))
     app.router.add_get(USAGE_PATH, observed(usage))
     # Neither probe is wrapped: a probe writes no event, takes no capacity and touches no

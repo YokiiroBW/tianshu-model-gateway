@@ -35,3 +35,9 @@ git diff --check
 17 项通过：真实本地 TLS 枚举/短回复及 5 key 并发隔离、真实 HTTP 自定义 DNS 固定、混合 DNS 拒绝、生产 loopback 拒绝、未信任证书拒绝、redirect 不跟随、401/403/404/405/429/500 去敏分型、端点与明确模型错误区分、空回复拒绝、分片/Unicode/含引号 key 反射阻断、有界响应、DNS 总超时、上游超时/取消/断连不重发、model 不可改写。HTTP/TLS 服务都是隔离录制替身，FixtureTargets 仅在测试中放行 loopback；没有访问公网供应商。新模块未被旧 server import，因此没有重复旧未变化全套测试。
 
 未验证：平台真实 RPC 生产消费、HTTP 管理路由、管理员网页、动态 runtime grant/撤销/续期、SSE 动态目标接线、容器/NAS/真实供应商/真正对话。不能据本记录宣称自助供应商整体完成或部署完成。
+
+## 2026-09-26 后端接线续交
+
+本工作树现有独立管理 `models/test` HTTP 路由、专用平台凭据、动态 runtime source 及真实 Chat 主链路接线。每次动态请求在入队前、出队后和建连后向平台读取同一精确版本/turn 授权，socket 目标逐请求 DNS 固定，执行继续走原 scheduler、诊断、SSE 和回执。原文“尚未接入 HTTP/主链路”只描述第一次 G1 交付。网关不读取平台目录或跨产品数据库。
+
+验证：适配器 17 项、现有 HTTP 28 项、根平台-网关-陪伴联合 4 项通过；全部为隔离本地 HTTP/TLS 录制，不含真实供应商。当前没有 NAS/容器或付费调用。完整证据和部署接线见根 `docs/handoffs/PROVIDER-BACKEND-2026-09-26.md`。
