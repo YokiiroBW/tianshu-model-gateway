@@ -43,9 +43,46 @@ class ExecutionContext:
 class TargetPolicy:
     # CIDRs are supplied by deployment, never by a provider-management request.
     local_networks: tuple[str, ...] = ()
+    nat64_prefixes: tuple[str, ...] = ("64:ff9b::/96",)
+
+    def __post_init__(self):
+        if len(self.nat64_prefixes) > 16:
+            raise ValueError("too many NAT64 prefixes")
+        for value in self.nat64_prefixes:
+            prefix = ipaddress.ip_network(value, strict=True)
+            if not isinstance(prefix, ipaddress.IPv6Network) or prefix.prefixlen not in {
+                32,
+                40,
+                48,
+                56,
+                64,
+                96,
+            }:
+                raise ValueError("invalid NAT64 prefix")
+
+    @staticmethod
+    def _embedded_v4(ip, prefix):
+        """RFC 6052: remove the reserved u-octet for prefixes shorter than /96."""
+        if ip not in prefix:
+            return None
+        packed = ip.packed
+        if prefix.prefixlen == 96:
+            return ipaddress.IPv4Address(packed[12:16])
+        if packed[8] != 0:
+            return False  # malformed translation address must not be treated as global
+        compact = packed[:8] + packed[9:]
+        offset = prefix.prefixlen // 8
+        return ipaddress.IPv4Address(compact[offset : offset + 4])
 
     def permits(self, address, connection_type):
         ip = ipaddress.ip_address(address)
+        if isinstance(ip, ipaddress.IPv6Address):
+            for value in self.nat64_prefixes:
+                embedded = self._embedded_v4(ip, ipaddress.ip_network(value))
+                if embedded is False:
+                    return False
+                if embedded is not None:
+                    return self.permits(embedded, connection_type)
         if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
             return False
         if ip.is_reserved or getattr(ip, "ipv4_mapped", None):

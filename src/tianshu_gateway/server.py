@@ -53,7 +53,7 @@ from .observability import (
 from .observability import events as observation_events
 from .observability import health as probe_health
 from .observability.events import load_contract
-from .provider_adapter import ExecutionContext, OpenAIAdapter, ProviderFailure
+from .provider_adapter import ExecutionContext, OpenAIAdapter, ProviderFailure, TargetPolicy
 from .provider_runtime import ProviderRuntimeSource
 from .origin_renewal import (
     CurrentCache,
@@ -189,6 +189,7 @@ class Settings:
     platform_origin_renewal: bool = False
     provider_management_credential_ref: str | None = None
     provider_self_service: bool = False
+    provider_nat64_prefixes: tuple[str, ...] = ()
 
     @property
     def policy(self):
@@ -202,6 +203,11 @@ class Settings:
     def validate(self):
         if type(self.provider_self_service) is not bool:
             raise ValueError("provider self service flag required")
+        if not isinstance(self.provider_nat64_prefixes, (list, tuple)) or not all(
+            isinstance(value, str) for value in self.provider_nat64_prefixes
+        ):
+            raise ValueError("NAT64 prefixes must be deployment CIDRs")
+        TargetPolicy(nat64_prefixes=("64:ff9b::/96", *self.provider_nat64_prefixes))
         if self.provider_management_credential_ref is not None:
             ref = self.provider_management_credential_ref
             if (
@@ -361,7 +367,9 @@ class Gateway:
                 self.native_cache = CurrentCache(self.native_cache, self.origin_renewal)
         self.active = 0
         self.provider_active = {}
-        self.provider_adapter = OpenAIAdapter()
+        self.provider_adapter = OpenAIAdapter(
+            policy=TargetPolicy(nat64_prefixes=("64:ff9b::/96", *settings.provider_nat64_prefixes))
+        )
         self.dynamic_source = (
             ProviderRuntimeSource(
                 session, settings.platform_base_url, self.secrets, settings.platform_credential_ref

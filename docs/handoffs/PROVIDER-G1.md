@@ -41,3 +41,7 @@ git diff --check
 本工作树现有独立管理 `models/test` HTTP 路由、专用平台凭据、动态 runtime source 及真实 Chat 主链路接线。每次动态请求在入队前、出队后和建连后向平台读取同一精确版本/turn 授权，socket 目标逐请求 DNS 固定，执行继续走原 scheduler、诊断、SSE 和回执。原文“尚未接入 HTTP/主链路”只描述第一次 G1 交付。网关不读取平台目录或跨产品数据库。
 
 验证：适配器 17 项、现有 HTTP 28 项、根平台-网关-陪伴联合 4 项通过；全部为隔离本地 HTTP/TLS 录制，不含真实供应商。当前没有 NAS/容器或付费调用。完整证据和部署接线见根 `docs/handoffs/PROVIDER-BACKEND-2026-09-26.md`。
+
+### 审查修复续交
+
+`TargetPolicy` 现识别 RFC 6052 well-known NAT64 /96 前缀中嵌入的 IPv4，并对该地址重复执行原目标策略；`provider_nat64_prefixes` 允许部署登记实际使用的网络专用 /32、/40、/48、/56、/64、/96 前缀，启动时校验格式。仅 DNS/应用代码无法推断未登记的翻译路由，部署仍须限制出站目标。原公网 HTTPS/TLS 主机名校验未放宽。适配器 18 项、现有 HTTP 28 项、根联合 6 项通过；仍未访问 NAS 或真实供应商。

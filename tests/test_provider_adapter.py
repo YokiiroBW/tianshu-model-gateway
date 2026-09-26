@@ -1,6 +1,7 @@
 """Recorded local HTTP/TLS only; loopback permission exists in the fixture, not runtime."""
 
 import asyncio
+import ipaddress
 import ssl
 import tempfile
 import unittest
@@ -62,6 +63,45 @@ class AddressTests(unittest.TestCase):
         self.assertEqual(
             checked_base("https://example.com/v1/", "public")[0], "https://example.com/v1"
         )
+
+    def test_nat64_targets_recheck_embedded_ipv4(self):
+        policy = TargetPolicy()
+        for address in (
+            "64:ff9b::a9fe:a9fe",  # 169.254.169.254 metadata
+            "64:ff9b::a00:102",  # 10.0.1.2 private
+            "64:ff9b::7f00:1",  # loopback
+        ):
+            self.assertFalse(policy.permits(address, "public"), address)
+        self.assertTrue(policy.permits("64:ff9b::808:808", "public"))
+        prefix = ipaddress.IPv6Network("2001:4860:abcd:ef01::/64")
+        packed = (
+            prefix.network_address.packed[:8]
+            + b"\x00"
+            + ipaddress.IPv4Address("169.254.169.254").packed
+            + b"\x00" * 3
+        )
+        mapped = str(ipaddress.IPv6Address(packed))
+        self.assertTrue(TargetPolicy().permits(mapped, "public"))
+        custom = TargetPolicy(nat64_prefixes=("64:ff9b::/96", str(prefix)))
+        self.assertFalse(custom.permits(mapped, "public"))
+        for cidr, address in (
+            ("2001:db8::/32", "2001:db8:c000:221::"),
+            ("2001:db8:100::/40", "2001:db8:1c0:2:21::"),
+            ("2001:db8:122::/48", "2001:db8:122:c000:2:2100::"),
+            ("2001:db8:122:300::/56", "2001:db8:122:3c0:0:221::"),
+            ("2001:db8:122:344::/64", "2001:db8:122:344:c0:2:2100::"),
+            ("2001:db8:122:344::/96", "2001:db8:122:344::192.0.2.33"),
+        ):
+            self.assertEqual(
+                "192.0.2.33",
+                str(
+                    TargetPolicy._embedded_v4(
+                        ipaddress.IPv6Address(address), ipaddress.IPv6Network(cidr)
+                    )
+                ),
+            )
+        with self.assertRaises(ValueError):
+            TargetPolicy(nat64_prefixes=("2001:4860::/65",))
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
