@@ -45,3 +45,9 @@ git diff --check
 ### 审查修复续交
 
 `TargetPolicy` 现识别 RFC 6052 well-known NAT64 /96 前缀中嵌入的 IPv4，并对该地址重复执行原目标策略；`provider_nat64_prefixes` 允许部署登记实际使用的网络专用 /32、/40、/48、/56、/64、/96 前缀，启动时校验格式。仅 DNS/应用代码无法推断未登记的翻译路由，部署仍须限制出站目标。原公网 HTTPS/TLS 主机名校验未放宽。适配器 18 项、现有 HTTP 28 项、根联合 6 项通过；仍未访问 NAS 或真实供应商。
+
+### 2026-09-27 短回复测试预算兼容修复
+
+基线 `f93b08a6ce2d31774d2f1b27dc00fd4d5f3ee26d` 的 `test_reply` 固定 `max_tokens=16`。总控在 NAS 上报告 DeepSeek legacy `deepseek-v4-flash` 的原测试返回 `upstream_invalid/unknown`，但未保存原 16-token 上游响应结构；“推理耗尽预算”是与现象相容的推断，不能当作已证原因。总控另提供同一预选供应商、受控目标和 TLS 路径的一次 256-token 结构诊断：HTTP 200、identity、`finish_reason=stop`、最终 `content` 长 3、`reasoning_content` 长 64、`completion_tokens=20`，证明 256-token 请求可产生非空最终回复。DeepSeek 官方文档说明 thinking 默认开启、推理与最终回复分别在 `reasoning_content` 和 `content`；参见 https://api-docs.deepseek.com/guides/thinking_mode/ 与 https://api-docs.deepseek.com/api/create-chat-completion/ 。
+
+本候选只把管理短回复测试的固定 `max_tokens` 从 16 调至 256；保留一次 POST、固定提示词、原始非空最终 `content` 和 `finish_reason` 校验、超时/取消不重发、上游结果未知语义。未新增厂商参数或把 `reasoning_content` 当作成功回复。新增本地 TLS 录制夹具：显式 16-token 截断时推理有值而最终内容空仍报 `invalid_response/unknown`；256-token 时推理与最终内容并存则一次成功；即使 `finish_reason=stop`，空最终内容仍报未知。受影响范围 `test_provider_adapter.py` 与 `test_gateway_http.py` 合计 49 passed、10 subtests passed；根平台/网关/陪伴联合 6 passed。Ruff 与 diff check 通过。本任务不操作 NAS、不再次调用真实供应商；该候选须独立复核、集成与另行部署，不能据隔离夹具宣称线上已修复。

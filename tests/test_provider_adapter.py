@@ -161,6 +161,28 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             return web.json_response(
                 {"choices": [{"message": {"content": "OK"}, "finish_reason": []}]}
             )
+        if self.mode in {"reasoning-budget", "reasoning-only"}:
+            enough = self.mode == "reasoning-budget" and body["max_tokens"] > 16
+            return web.json_response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "reasoning_content": "Synthetic reasoning before the final answer.",
+                                "content": "OK" if enough else "",
+                            },
+                            "finish_reason": "stop"
+                            if enough or self.mode == "reasoning-only"
+                            else "length",
+                        }
+                    ],
+                    "usage": {
+                        "completion_tokens": 20 if enough else 16,
+                        "completion_tokens_details": {"reasoning_tokens": 17 if enough else 16},
+                    },
+                }
+            )
         if self.mode == "compressed":
             return web.Response(body=b"unused", headers={"Content-Encoding": "gzip"})
         if self.mode == "raw-reflection":
@@ -205,10 +227,40 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 "model": "fixture-model",
                 "stream": False,
                 "messages": [{"role": "user", "content": "Reply with OK."}],
-                "max_tokens": 16,
+                "max_tokens": 256,
             },
         )
         self.assertNotIn("fixture-key", repr(self.context()))
+
+    async def test_reasoning_budget_reaches_a_final_reply_in_one_request(self):
+        self.mode = "reasoning-budget"
+        result = await self.adapter.test_reply(self.context())
+        self.assertTrue(result["reply_verified"])
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.requests[0][3]["max_tokens"], 256)
+        self.assertEqual(set(self.requests[0][3]), {"model", "stream", "messages", "max_tokens"})
+
+    async def test_reasoning_budget_fixture_refuses_16_token_truncation(self):
+        self.mode = "reasoning-budget"
+        with self.assertRaises(ProviderFailure) as caught:
+            await self.adapter.complete(
+                self.context(),
+                {"messages": [{"role": "user", "content": "Reply with OK."}], "max_tokens": 16},
+            )
+        self.assertEqual(
+            (caught.exception.code, caught.exception.outcome), ("invalid_response", "unknown")
+        )
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.requests[0][3]["max_tokens"], 16)
+
+    async def test_reasoning_without_final_content_is_still_unknown(self):
+        self.mode = "reasoning-only"
+        with self.assertRaises(ProviderFailure) as caught:
+            await self.adapter.test_reply(self.context())
+        self.assertEqual(
+            (caught.exception.code, caught.exception.outcome), ("invalid_response", "unknown")
+        )
+        self.assertEqual(len(self.requests), 1)
 
     async def test_dns_pinned_once(self):
         # DNS host does not resolve normally; registered resolver owns the only connection.
