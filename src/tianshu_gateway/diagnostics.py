@@ -293,6 +293,53 @@ class Diagnostics:
                 PRIMARY KEY(contract, principal_id, caller_service, credential_namespace, turn_id));
         """)
         self.migration_backup = self.migrate(deployed)
+        self.recover_executions()
+
+    def recover_executions(self):
+        """A previous process cannot still own an active task; never replay its call."""
+        with self.connection:
+            for table in ("requests", "native_requests"):
+                rows = self.connection.execute(
+                    f"SELECT rowid, receipt FROM {table} WHERE reason='in_flight'"
+                ).fetchall()
+                for row_id, raw in rows:
+                    receipt = json.loads(raw)
+                    execution = receipt.get("execution")
+                    if isinstance(execution, dict):
+                        execution.update(state="unknown", error_code="interrupted")
+                    receipt["outcome"] = "unknown"
+                    receipt["usage_complete"] = False
+                    self.connection.execute(
+                        f"UPDATE {table} SET receipt=?,reason='interrupted_unknown' WHERE rowid=?",
+                        (json.dumps(receipt), row_id),
+                    )
+
+    def progress(self, receipt):
+        self._progress("requests", (receipt["caller_service"], receipt["request_id"]), receipt)
+
+    def native_progress(self, receipt):
+        self._progress(
+            "native_requests", (*native_identity(receipt), receipt["request_id"]), receipt
+        )
+
+    def _progress(self, table, identity, receipt):
+        # Terminal rows are immutable to checkpoints or a racing cancellation request.
+        columns = (
+            ("service", "request_id")
+            if table == "requests"
+            else (*NATIVE_IDENTITY_FIELDS, "request_id")
+        )
+        where = " AND ".join(f"{column}=?" for column in columns)
+        try:
+            with self.connection:
+                self.connection.execute(
+                    f"UPDATE {table} SET receipt=? WHERE {where} AND reason='in_flight'",
+                    (json.dumps(receipt), *identity),
+                )
+        except sqlite3.Error:
+            # A checkpoint is observation, not permission to repeat or discard an attempt.
+            # The final receipt still uses the existing mandatory terminal write.
+            LOG.warning("execution_checkpoint_degraded")
 
     def migrate(self, deployed):
         """Apply the private-schema steps in order, copying an existing database first.

@@ -41,7 +41,7 @@ class ProviderRuntimeSource:
                     document = loads(raw)
             if (
                 not isinstance(document, dict)
-                or set(document)
+                or set(document) - {"verified_capabilities", "unsupported_capabilities"}
                 != {
                     "config_version",
                     "provider_id",
@@ -58,6 +58,23 @@ class ProviderRuntimeSource:
                 or not isinstance(document["api_key"], str)
                 or not isinstance(document["base_url"], str)
                 or not isinstance(document["model_id"], str)
+            ):
+                raise Rejected("dependency_unavailable", 503)
+            for field in ("verified_capabilities", "unsupported_capabilities"):
+                values = document.get(field, [])
+                if (
+                    not isinstance(values, list)
+                    or len(values) > 5
+                    or any(
+                        not isinstance(value, str)
+                        or value not in {"text", "stream", "tools", "vision", "reasoning"}
+                        for value in values
+                    )
+                    or len(set(values)) != len(values)
+                ):
+                    raise Rejected("dependency_unavailable", 503)
+            if set(document.get("verified_capabilities", [])) & set(
+                document.get("unsupported_capabilities", [])
             ):
                 raise Rejected("dependency_unavailable", 503)
             return document

@@ -8,12 +8,12 @@ from pathlib import Path
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from referencing import Registry, Resource
 
-# Published text-dialogue/v1 1.0.0 (unchanged by this slice).
-MANIFEST_SHA256 = "81e6cc4ddef7c6f82e055d4cb04b090db036dd5c52763473ce697aa02db478a1"
-MODEL_SCHEMA_SHA256 = "9ffa9055aca897ff57292555f37674d79df687d1d6c062df48267527a8ff3a7c"
-COMMON_SCHEMA_SHA256 = "b296a79d7eb0218d9b444c4ddbba837ad576f46a7a4e50fbcebec7618d8ef9af"
+# Published text-dialogue/v1 1.0.0, optional C2 model-execution extension (2026-10-04).
+MANIFEST_SHA256 = "90697e6ecbb587d3db8c8e4682f7f8f43a8b1a98f70d8835c8282b03828d2d3a"
+MODEL_SCHEMA_SHA256 = "d8bb87e94221bb0cf65d050bb898fe5988b0df2e34c8bc62776e59a77c793c1f"
+COMMON_SCHEMA_SHA256 = "938b7c8b9fb69419dd6afc94d29c4b341697403f34af11d743d2cd8d684ab687"
 # Published model-protocol/v1 1.0.0 native manifest (LF-normalized SHA-256).
-NATIVE_MANIFEST_SHA256 = "52711a71de56dbceebd1d5d96b2baf59a2d9551168029972d59111480f815141"
+NATIVE_MANIFEST_SHA256 = "832abdbfbbb49d71bffc0aabdd816f4de92d892680f26cc5f05402e397d34262"
 NATIVE_PACKAGE = "model-protocol/v1"
 NATIVE_MODEL_ID = "https://contracts.tianshu.invalid/model-protocol/v1/model.json"
 COMMON_ID = "https://contracts.tianshu.invalid/text-dialogue/v1/common.json"

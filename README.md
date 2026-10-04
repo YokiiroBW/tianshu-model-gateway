@@ -2,11 +2,13 @@
 
 原生协议、请求转发、线路与用量。
 
-TS-041 已实现首轮 Python HTTP 数据入口：原生 Chat Completions、平台版本化配置读取、凭据引用、独立持久化路由回执及实际 SSE 转发。当前证据是隔离本地 HTTP 替身；尚未接通实际平台服务或真实模型。旧代码来源见主工作区 workspace.json。
+TS-041 已实现首轮 Python HTTP 数据入口：原生 Chat Completions、平台版本化配置读取、凭据引用、独立持久化路由回执及实际 SSE 转发。既有 OpenCode 接入修复已由协调者部署，用户确认真实 QQ 回复；本轮 C2 候选的新增能力证据仍是隔离本地 HTTP。旧代码来源见主工作区 workspace.json。
 
 本项目有独立 Git；协调检出不供并发写入，任务在主工作区 worktrees 中进行。工作目录上下文见 .runtime/workspace-context.json，或回到主工作区 docs/development/CURRENT.md。
 
-TS-040 的[复用审查](docs/protocol-reuse-review.md)和[交接](docs/handoffs/TS-040.md)保留为历史基线；其 tests 实验不作为生产代码或 wire 定义。当前消费主工作区 `contracts/text-dialogue/v1` 的 1.0.0（发布提交 `102d347`）与 `contracts/model-protocol/v1` 的 1.0.0（native manifest LF SHA256 `52711a71de56dbceebd1d5d96b2baf59a2d9551168029972d59111480f815141`）。运行时读取所用 schema 并验证 manifest 和文件摘要，绝不联网解析 schema。
+TS-040 的[复用审查](docs/protocol-reuse-review.md)和[交接](docs/handoffs/TS-040.md)保留为历史基线；其 tests 实验不作为生产代码或 wire 定义。当前消费 `contracts/text-dialogue/v1` 与 `contracts/model-protocol/v1` 的 1.0.0，含 2026-10-04 主协调发布的可选模型执行扩展；精确摘要仅在 `src/tianshu_gateway/contracts.py` 固定。运行时验证 manifest 和文件摘要，绝不联网解析 schema。
+
+C2 沿用原生 Chat/Responses HTTP 与 SSE，补精确能力查询、拥有者取消、同回执行内的有界进度和中断恢复；支持原生图片输入及工具结果续答，不执行工具、不抓图、不转换协议。未验证的模型能力允许原生尝试，只有配置明确声明不支持才拒绝。流进度不等于终端用户送达，取消不证明供应商未执行或未计费。公共入口和状态语义见 [运行说明](docs/gateway-runtime.md#c2-模型执行扩展)。
 
 ## 安装与验证
 

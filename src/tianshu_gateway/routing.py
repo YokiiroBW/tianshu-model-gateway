@@ -6,6 +6,7 @@ import time
 
 from .config import utcnow
 from .contracts import Rejected, loads
+from .execution import FINISH_REASONS, check_capabilities
 
 PROTOCOL = "openai-chat-completions"
 STATE_KEYS = {
@@ -118,6 +119,7 @@ def prepare(contracts, body, config, grant, request_id, internal):
             }
         )
     contracts.validate("model#upstream_request", effective)
+    check_capabilities(provider, effective)
     if not effective["model"].strip() or any(
         ord(c) < 32 or ord(c) == 127 for c in effective["model"]
     ):
@@ -219,6 +221,8 @@ class StreamObserver:
         self.done = self.invalid = self.error = False
         self.finished = set()
         self.native_usage = None
+        self.event_count = 0
+        self.finish_reasons = set()
         self.first_upstream_byte_ms = None
         self.first_event_ms = None
         self.first_output_ms = None
@@ -268,6 +272,7 @@ class StreamObserver:
     def dispatch(self):
         if not self.data:
             return
+        self.event_count += 1
         if self.first_event_ms is None:
             self.first_event_ms = self.elapsed_ms()
         if self.event_type == b"error":
@@ -299,6 +304,7 @@ class StreamObserver:
                     raise Rejected()
                 if type(index) is int and isinstance(finish, str) and finish:
                     self.finished.add(index)
+                    self.finish_reasons.add(finish if finish in FINISH_REASONS else "other")
         except (Rejected, AttributeError, TypeError):
             self.invalid = True
 

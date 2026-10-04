@@ -139,7 +139,7 @@ class ResponsesObserverTests(unittest.TestCase):
             {"tools": [{"type": "file_search", "vector_store_ids": ["vs_x"]}]},
             {"input": [{"type": "item_reference", "id": "item_x"}]},
             {"input": [{"role": "user", "content": [{"type": "input_file", "file_id": "file_x"}]}]},
-            {"input": [{"type": "input_image", "image_url": "https://example.invalid/a"}]},
+            {"input": [{"type": "input_audio", "data": "unsupported"}]},
             {"stream": 1},
             {"store": None},
             {"model": ""},

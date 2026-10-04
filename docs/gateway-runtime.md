@@ -1,6 +1,6 @@
 # TS-041 运行与集成边界
 
-本切片消费发布提交 `102d347` 中的合同 1.0.0。manifest 按 UTF-8、CRLF→LF 计算的 SHA-256 为 `81e6cc4ddef7c6f82e055d4cb04b090db036dd5c52763473ce697aa02db478a1`；model schema 为 `9ffa9055aca897ff57292555f37674d79df687d1d6c062df48267527a8ff3a7c`。不复制旧控制平面，不创建本地模型配置发布接口。
+本服务消费合同 1.0.0，含 2026-10-04 主协调发布的可选模型执行扩展。精确 manifest/schema 摘要仅在 `src/tianshu_gateway/contracts.py` 固定，按 UTF-8、CRLF→LF 核验。不复制旧控制平面，不创建本地模型配置发布接口。
 
 ## 部署输入
 
@@ -79,7 +79,7 @@
 
 ## TS-042 原生 Responses 运行边界
 
-消费已发布 `contracts/model-protocol/v1` 1.0.0（manifest LF SHA256 `52711a71de56dbceebd1d5d96b2baf59a2d9551168029972d59111480f815141`）。默认关闭：只有显式给出下面四项才注册路由，缺任一项在启动时报配置错误，不会“看起来可用”。
+消费已发布 `contracts/model-protocol/v1` 1.0.0，摘要见 `contracts.py`。默认关闭：只有显式给出下面四项才注册路由，缺任一项在启动时报配置错误，不会“看起来可用”。
 
 ```json
 {
@@ -162,3 +162,23 @@
 - 队长上限：队列满时立即返回 429 `queue_full`，不转发、不写执行行；这与无排队部署的拒绝语义一致。
 - 重启语义：队列、计数与保留量都是**进程内内存状态**。进程重启即丢失等待顺序，等待中的调用方看到连接关闭，前一个进程不会补发；本切片**不承诺**持久队列、跨进程协调或恢复。已经开始的尝试仍按既有回执核对。
 - 验证界限：`tests/test_ts044_scheduling.py` 先用调度模块自己的窄端口（注入时钟、假诊断端口、无 HTTP）验证容量/保留/公平/期限/取消/归还后当步推进队列/幂等释放与锁外观测，再用真实网关与录制上游验证交互能进、后台不饿死、跨协议共用同一池与 provider 额度、队长硬上限、超时/取消/撤权/重复键零额外上游、等待时长只在私有表、以及 CLI 子进程用同一部署文档装配同一池。全部为本机 loopback 夹具；不代表生产负载容量、生产限流策略或多进程部署已验收。
+
+
+## C2 模型执行扩展
+
+沿用原生 POST `/v1/chat/completions` 与已启用的 `/v1/responses`。`stream:true` 仍透传供应商 SSE，不合成文字或终止事件。Chat 的工具 ID、名称和 arguments 可以分片；消费者按 choice/call index 收齐后执行工具，将 assistant.tool_calls 和 role:tool/tool_call_id 原样用于下一次请求。Responses 的 function/custom 调用及结果同样保持原生。Gateway 不执行工具。
+
+Chat 图片仍用 content 的 `image_url` 部分；Responses 可用 inline `input_image` 的 `image_url`（含 data URL）。原生字节不重写，Gateway 不访问图片地址。file_id、输入音频/文件与服务端状态引用仍按既有范围明确拒绝；不把它们转换为文字摘要。内部 OpenCode 调用在两种协议中均沿用 `X-Tianshu-Provider-Session`、诚实 User-Agent 和稳定不透明路由会话；这个元数据不授予权限。
+
+- GET `/internal/v1/model-capabilities` 使用生成请求相同的 Chat 认证、配置版本、turn/workload 头，不接受 query/body，不调用上游模型。
+- GET `/internal/v1/native-model-capabilities` 使用原生 grant、配置版本与内部 turn 头；原 native_enabled 开关仍控制是否开放。
+- 返回精确 provider/model/protocol、verification_source 和 text/stream/tools/vision/reasoning。native:true 仅说明 Gateway 的协议透传能力。fixture_only 不冒称真实已验证；未声明或未验证的能力可以尝试。只有可信配置显式列为 unsupported_capabilities 才在发起前返回 capability_unsupported/422。两组声明不能重叠。
+- POST `/internal/v1/model-requests/{request_id}/cancel`、原生对称 `/internal/v1/native-model-requests/{request_id}/cancel` 接受 JSON `{}`，使用原认证拥有者，不增加授权。原生所有权仍包括 contract/principal/caller/credential namespace。其他主体或未知 ID 返回 404。
+- requested 表示已请求终止本地活动任务；已终结记录返回 terminal，不改已有结果。not_active 表示有持久记录但没有当前任务，不能据此声称未执行。upstream_outcome 只有在 upstream_started:false 时才能表示 not_started。取消发起后的调用关闭上游连接、不重试，供应商结果和计费仍可能未知。
+- 排队取消在同一回执行保存 execution.state:cancelled/upstream_started:false，并以 request_cancelled/409、execution_state:not_started 结束原请求。普通排队拒绝仍保留原先“不建立上游回执”的行为。
+
+原回执 GET 增可选 execution：queued/running/completed/cancelled/failed/unknown、upstream_started、接收/转发字节计数、完整 SSE data 事件数、识别到输出、固定 finish_reasons、cancel_requested 和固定 error_code；不保存文本、工具参数、图片地址或上游错误正文。流进度在同 requests/native_requests 行内按有界频率更新，不新增表。forwarded_bytes 统计流的 write 接受字节，不证明终端用户收到；非流 JSON 在最终回执写入后才交框架发送，未观察到传输的 forwarded_bytes 保持 0。模型用量继续单独记录实际供应商数据；未知/未报告值为 null，部分用量不当完整结果。
+
+重启只将遗留在途 execution 标为 unknown/interrupted，保留已观测计数及用量，不恢复、重发或重复计费请求。旧回执没有 execution 字段仍可读。此为同回执行的可选数据扩展，没有数据库 schema 迁移；旧程序的严格合同读取器需要与正式合同一起升级或使用原固定发布包。
+
+验证仅使用隔离本地 HTTP 平台/供应商夹具；真实供应商的工具、视觉和流能力需按 provider/model 分别验证，不从协议形状推断已具备。官方协议资料：[流式](https://developers.openai.com/api/docs/guides/streaming-responses)、[工具调用](https://developers.openai.com/api/docs/guides/function-calling)、[图片输入](https://developers.openai.com/api/docs/guides/images-vision)。

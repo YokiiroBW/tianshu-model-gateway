@@ -34,6 +34,7 @@ from .contracts import (
     loads,
 )
 from .diagnostics import NATIVE_IDENTITY_FIELDS, Diagnostics, attempt_metrics, redact
+from .execution import Executions, capability_projection, check_capabilities
 from .native import (
     NativeConfigCache,
     NativeConfigSource,
@@ -78,13 +79,17 @@ INTERNAL_HEADERS = {"x-tianshu-config-version", "x-tianshu-workload", "x-tianshu
 NATIVE_HEADERS = {
     NATIVE_VERSION_HEADER.lower(),
     "x-tianshu-turn-id",
+    PROVIDER_SESSION_HEADER.lower(),
 }
 NATIVE_ROUTE_HEADERS = {"x-request-id"} | NATIVE_HEADERS | {"authorization"}
 # Private, authenticated operations reads. They are not part of either published contract
 # and return no message body, tool argument, credential or provider URL.
 USAGE_PATH = "/internal/v1/model-usage"
 NATIVE_USAGE_PATH = "/internal/v1/native-model-usage"
+CAPABILITIES_PATH = "/internal/v1/model-capabilities"
+NATIVE_CAPABILITIES_PATH = "/internal/v1/native-model-capabilities"
 REQUEST_ID = web.RequestKey("request_id", str)
+EXECUTION = web.RequestKey("execution", object)
 FORWARD_STARTED = web.RequestKey("forward_started", bool)
 STREAM_RESPONSE = web.RequestKey("stream_response", web.StreamResponse)
 # TS-103 observation state of one in-flight request. Both are per-request facts about what has
@@ -375,6 +380,7 @@ class Gateway:
                 self.native_cache = CurrentCache(self.native_cache, self.origin_renewal)
         self.active = 0
         self.provider_active = {}
+        self.executions = Executions()
         self.provider_adapter = OpenAIAdapter(
             policy=TargetPolicy(nat64_prefixes=("64:ff9b::/96", *settings.provider_nat64_prefixes))
         )
@@ -472,7 +478,8 @@ class Gateway:
             "protocol": source["protocol"],
             "model_id": source["model_id"],
             "capability_verification": "provider_test",
-            "verified_capabilities": ["text"],
+            "verified_capabilities": source.get("verified_capabilities", ["text"]),
+            "unsupported_capabilities": source.get("unsupported_capabilities", []),
             "model_policy": {"mode": "preserve_client", "fields": {}},
             "reasoning_policy": {"mode": "preserve_client", "fields": {}},
         }
@@ -865,12 +872,143 @@ class Gateway:
 
     async def receipt(self, request):
         grant = self.authenticate(request)
-        result = self.diagnostics.get(grant.service, request.match_info["request_id"])
+        request_id = request.match_info["request_id"]
+        result = self.diagnostics.get(grant.service, request_id)
+        active = self.executions.active.get(("chat", grant.service, request_id))
+        if result is None and active is not None:
+            result = active.receipt
         if result is None:
             raise Rejected("not_found", 404)
         return web.json_response(
             redact(result, self.secrets.known_values()), headers={"Cache-Control": "no-store"}
         )
+
+    async def chat_config(self, grant, version, turn_id):
+        if self.dynamic_source is not None and version not in (
+            grant.config_version,
+            *grant.allowed_versions,
+        ):
+            source = await self.dynamic_source.fetch(version, turn_id, grant.service)
+            return (
+                self.dynamic_config(source),
+                replace(grant, provider_id=source["provider_id"]),
+                source,
+            )
+        return await self.cache.get(version), grant, None
+
+    async def capabilities(self, request, native=False):
+        if request.query_string or request.can_read_body:
+            raise Rejected()
+        if native:
+            grant = self.authenticate_native(request)
+            request_id, version, _ = self.native_context(request, grant)
+            config = await self.native_cache.get(grant, version)
+            binding = next(b for b in config["bindings"] if b["workload"] == "native.responses")
+            _, provider = select_native_route(config, grant, {"model": binding["model_id"]})
+            version = config["native_config_version"]
+        else:
+            grant = self.authenticate(request)
+            request_id, version, turn_id = self.context(request, grant)
+            config, route_grant, _ = await self.chat_config(grant, version, turn_id)
+            binding = next(b for b in config["bindings"] if b["workload"] == "companion.text")
+            if binding["provider_id"] != route_grant.provider_id:
+                raise Rejected("forbidden", 403)
+            provider = next(
+                p for p in config["providers"] if p["provider_id"] == binding["provider_id"]
+            )
+        request[REQUEST_ID] = request_id
+        result = capability_projection(provider, request_id, version)
+        self.contracts.validate("model#capability_response", result)
+        return web.json_response(redact(result, self.secrets.known_values()), headers=NO_STORE)
+
+    def checkpoint(self, execution, receipt, secrets, native=False, force=False):
+        receipt["execution"] = execution.snapshot()
+        execution.receipt = receipt
+        if not force and not execution.checkpoint_due():
+            return
+        safe = redact(receipt, secrets)
+        self.contracts.validate("native#route_receipt" if native else "model#route_receipt", safe)
+        write = self.diagnostics.native_progress if native else self.diagnostics.progress
+        write(safe)
+
+    async def cancel(self, request, native=False):
+        if native:
+            grant = self.authenticate_native(request)
+            authorize(grant)
+            identity = grant.identity()
+            key = ("native", *identity, request.match_info["request_id"])
+        else:
+            grant = self.authenticate(request)
+            key = ("chat", grant.service, request.match_info["request_id"])
+        request_id = request.match_info["request_id"]
+        self.contracts.validate("common#id", request_id)
+        if (
+            request.query_string
+            or request.content_type != JSON_TYPE
+            or request.headers.get("Content-Encoding")
+        ):
+            raise Rejected()
+        try:
+            async with asyncio.timeout(self.settings.request_read_timeout):
+                body = loads(await read_limited(request.content, 4096))
+        except TimeoutError:
+            raise Rejected("timeout", 408) from None
+        self.contracts.validate("model#cancel_request", body)
+        execution = self.executions.active.get(key)
+        receipt = (
+            self.diagnostics.native_get(identity, request_id)
+            if native
+            else self.diagnostics.get(grant.service, request_id)
+        )
+        if receipt is None and execution is None:
+            raise Rejected("not_found", 404)
+        state = "not_active"
+        outcome = "unknown"
+        if receipt is not None:
+            outcome = (
+                receipt["outcome"] if receipt["outcome"] in {"succeeded", "failed"} else "unknown"
+            )
+            observed = receipt.get("execution", {})
+            if observed.get("upstream_started") is False:
+                outcome = "not_started"
+            if receipt["outcome"] in {"succeeded", "failed", "cancelled"} or observed.get(
+                "state"
+            ) in {
+                "completed",
+                "cancelled",
+                "failed",
+                "unknown",
+            }:
+                state = "terminal"
+        if execution is not None and execution.state in {"queued", "running"}:
+            execution.cancel_requested = True
+            state = "requested"
+            outcome = "unknown" if execution.upstream_started else "not_started"
+            if execution.upstream_started:
+                self.checkpoint(execution, execution.receipt, execution.secrets, native, True)
+            else:
+                # Only an explicit cancellation before admission creates this no-attempt
+                # terminal. Ordinary admission refusals keep their existing no-row behaviour.
+                execution.finish("cancelled_before_start", "unknown")
+                safe = redact(execution.receipt, execution.secrets)
+                self.contracts.validate(
+                    "native#route_receipt" if native else "model#route_receipt", safe
+                )
+                if native:
+                    self.diagnostics.native_begin(safe, None)
+                    self.diagnostics.native_finish(safe, "cancelled_before_start", 0, None)
+                else:
+                    self.diagnostics.begin(safe, None)
+                    self.diagnostics.finish(safe, "cancelled_before_start", 0, None)
+            execution.task.cancel()
+        result = {
+            "schema_version": 1,
+            "request_id": request_id,
+            "state": state,
+            "upstream_outcome": outcome,
+        }
+        self.contracts.validate("model#cancel_response", result)
+        return web.json_response(result, headers=NO_STORE)
 
     def usage_report(self, request, key_space, identity):
         """Read-only projection of the authenticated caller's own metric rows."""
@@ -925,17 +1063,8 @@ class Gateway:
             raise Rejected("timeout", 408) from None
         body = loads(raw)
         self.contracts.validate("model#native_request", body)
-        dynamic = self.dynamic_source is not None and version not in (
-            grant.config_version,
-            *grant.allowed_versions,
-        )
-        if dynamic:
-            source = await self.dynamic_source.fetch(version, turn_id, grant.service)
-            config = self.dynamic_config(source)
-            route_grant = replace(grant, provider_id=source["provider_id"])
-        else:
-            config = await self.cache.get(version)
-            route_grant = grant
+        config, route_grant, source = await self.chat_config(grant, version, turn_id)
+        dynamic = source is not None
         effective, provider, binding, receipt = prepare(
             self.contracts, body, config, route_grant, request_id, grant.internal
         )
@@ -953,6 +1082,12 @@ class Gateway:
         slot = self.slot(
             request, grant.service, grant.internal, request_id, provider["provider_id"]
         )
+        key = ("chat", grant.service, request_id)
+        execution_secrets = (*self.secrets.known_values(), credential)
+        execution = self.executions.register(
+            key, redact(receipt, execution_secrets), execution_secrets
+        )
+        request[EXECUTION] = execution
         try:
             async with slot:
                 # Everything below is re-verified after the wait, immediately before sending:
@@ -981,6 +1116,9 @@ class Gateway:
                     else self.secrets.known_values()
                 )
                 receipt = redact(receipt, secrets)
+                execution.receipt = receipt
+                execution.secrets = tuple(secrets)
+                receipt["execution"] = execution.snapshot()
                 self.contracts.validate("model#route_receipt", receipt)
 
                 # The attempt that is about to cause a side effect is put on durable storage
@@ -991,6 +1129,8 @@ class Gateway:
                 async def submit(session):
                     if not await self.begin_upstream(request):
                         raise Rejected("dependency_unavailable", 503)
+                    execution.start()
+                    receipt["execution"] = execution.snapshot()
                     self.diagnostics.begin(receipt, turn_id)
                     request[FORWARD_STARTED] = True
                     payload = apply_fields(raw, effective, receipt["applied_policies"])
@@ -1025,6 +1165,22 @@ class Gateway:
             raise Rejected(exc.reason, exc.status) from None
         except TimeoutError:
             raise Rejected("timeout", 408) from None
+        except asyncio.CancelledError:
+            if execution.cancel_requested:
+                stream = request.get(STREAM_RESPONSE)
+                if stream is not None and stream.prepared:
+                    if request.transport:
+                        request.transport.abort()
+                    return stream
+                return error_response(
+                    Rejected("result_unknown", 502, "unknown")
+                    if execution.upstream_started
+                    else Rejected("request_cancelled", 409),
+                    request_id,
+                )
+            raise
+        finally:
+            self.executions.discard(key, execution)
 
     async def native_read(self, request):
         """Receipt read bound to the trusted identity, never to the request ID alone.
@@ -1037,6 +1193,11 @@ class Gateway:
         grant = self.authenticate_native(request)
         authorize(grant)
         result = self.native_ledger.native_get(grant.identity(), request.match_info["request_id"])
+        active = self.executions.active.get(
+            ("native", *grant.identity(), request.match_info["request_id"])
+        )
+        if result is None and active is not None:
+            result = active.receipt
         if result is None:
             raise Rejected("not_found", 404)
         return web.json_response(
@@ -1069,12 +1230,30 @@ class Gateway:
         self.contracts.validate("native#native_request", body)
         config = await self.native_cache.get(grant, version)
         binding, provider = select_native_route(config, grant, body)
+        check_capabilities(provider, body)
+        try:
+            provider_headers(provider["base_url"], request.headers.get(PROVIDER_SESSION_HEADER))
+        except ProviderFailure:
+            raise Rejected("invalid_input", 400) from None
         selected_version = config["native_config_version"]
         credential = self.secrets.resolve(provider["credential_ref"])
         self.targets.check(provider["base_url"])
         slot = self.slot(
             request, grant.service, grant.internal, request_id, provider["provider_id"]
         )
+        receipt = route_receipt(
+            grant,
+            provider,
+            body,
+            request_id,
+            selected_version,
+            utcnow().isoformat().replace("+00:00", "Z"),
+        )
+        execution_secrets = (*self.secrets.known_values(), credential)
+        receipt = redact(receipt, execution_secrets)
+        key = ("native", *grant.identity(), request_id)
+        execution = self.executions.register(key, receipt, execution_secrets)
+        request[EXECUTION] = execution
         try:
             async with slot:
                 # Re-verified after the wait, immediately before anything is sent: the permit,
@@ -1094,15 +1273,10 @@ class Gateway:
                 secrets = self.secrets.known_values()
                 context = route_context(grant, provider, request_id, turn_id, selected_version)
                 self.contracts.validate("native#route_context", context)
-                receipt = route_receipt(
-                    grant,
-                    provider,
-                    body,
-                    request_id,
-                    selected_version,
-                    utcnow().isoformat().replace("+00:00", "Z"),
-                )
                 receipt = redact(receipt, (*secrets, credential))
+                execution.receipt = receipt
+                execution.secrets = (*secrets, credential)
+                receipt["execution"] = execution.snapshot()
                 self.contracts.validate("native#route_receipt", receipt)
                 # Same durable gate as Chat, and for the same reason: the native attempt that is
                 # about to cause a side effect is on durable storage before it is sent.
@@ -1110,6 +1284,8 @@ class Gateway:
                     raise Rejected("dependency_unavailable", 503)
                 # Only a caller-supplied turn can be pinned; an external caller's turn id is a
                 # per-request correlation value, not a repeated client turn.
+                execution.start()
+                receipt["execution"] = execution.snapshot()
                 self.native_ledger.native_begin(receipt, turn_id if grant.internal else None)
                 request[FORWARD_STARTED] = True
                 # preserve_client: the client's own native bytes are the upstream payload.
@@ -1120,6 +1296,23 @@ class Gateway:
             raise Rejected(exc.reason, exc.status) from None
         except TimeoutError:
             raise Rejected("timeout", 408) from None
+        except asyncio.CancelledError:
+            if execution.cancel_requested:
+                stream = request.get(STREAM_RESPONSE)
+                if stream is not None and stream.prepared:
+                    if request.transport:
+                        request.transport.abort()
+                    return stream
+                return error_response(
+                    Rejected("result_unknown", 502, "unknown")
+                    if execution.upstream_started
+                    else Rejected("request_cancelled", 409),
+                    request_id,
+                    NATIVE_CONTRACT,
+                )
+            raise
+        finally:
+            self.executions.discard(key, execution)
 
     async def forward_native(
         self, request, payload, binding, provider, credential, receipt, secrets
@@ -1181,6 +1374,10 @@ class Gateway:
                 # A fixed observation seam: no chunk, no count, no content, and a failure inside
                 # it is confined to the event side channel.
                 on_first_output=first_output,
+                execution=request.get(EXECUTION),
+                integration_headers=provider_headers(
+                    provider["base_url"], request.headers.get(PROVIDER_SESSION_HEADER)
+                ),
             )
         except Rejected:
             response = state["response"]
@@ -1237,6 +1434,7 @@ class Gateway:
         response = None
         upstream_status = None
         observer = None
+        execution = request.get(EXECUTION)
         reason = "transport_unknown"
         # True when the downstream connection broke after this attempt had already sent headers,
         # which is what separates "the client went away" from "the attempt failed".
@@ -1288,12 +1486,20 @@ class Gateway:
                         request[STREAM_RESPONSE] = response
                         await response.prepare(request)
                         async for chunk in upstream.content.iter_any():
+                            if execution:
+                                execution.observe(received=len(chunk))
+                                if execution.received_bytes > self.settings.max_response_bytes:
+                                    raise Rejected("result_unknown", 502, "unknown")
                             observer.feed(chunk)
                             if observer.first_output_ms is not None:
                                 self.note_first_output(request, observer.first_output_ms)
                             safe = guard.feed(chunk)
                             if safe:
                                 await response.write(safe)
+                            if execution:
+                                execution.observe(forwarded=len(safe), observer=observer)
+                                record_usage(receipt, observer.native_usage, False)
+                                self.checkpoint(execution, receipt, secrets)
                         observer.end()
                         inspected = True
                         if not observer.complete:
@@ -1302,12 +1508,16 @@ class Gateway:
                         tail = guard.feed(b"", final=True)
                         if tail:
                             await response.write(tail)
+                            if execution:
+                                execution.observe(forwarded=len(tail), observer=observer)
                         await response.write_eof()
                         record_usage(receipt, observer.native_usage, True)
                     else:
                         if content_type != "application/json":
                             raise Rejected("result_unknown", 502, "unknown")
                         raw = await read_limited(upstream.content, self.settings.max_response_bytes)
+                        if execution:
+                            execution.observe(received=len(raw))
                         SecretGuard(secrets).feed(raw, final=True)
                         native = loads(raw)
                         if isinstance(native, dict):
@@ -1337,6 +1547,8 @@ class Gateway:
                             },
                         )
                         record_usage(receipt, native.get("usage"), True)
+                        if execution:
+                            execution.observe(choices=choices)
                         self.note_first_output(request, int((time.monotonic() - started) * 1000))
                     receipt["outcome"], reason = "succeeded", "completed"
                     return response
@@ -1358,6 +1570,10 @@ class Gateway:
                 return response
             return error_response(Rejected("result_unknown", 502, "unknown"), receipt["request_id"])
         finally:
+            if execution:
+                if observer:
+                    execution.observe(observer=observer)
+                receipt["execution"] = execution.finish(reason, receipt["outcome"])
             receipt["observed_at"] = utcnow().isoformat().replace("+00:00", "Z")
             safe_receipt = redact(receipt, secrets)
             self.contracts.validate("model#route_receipt", safe_receipt)
@@ -1418,6 +1634,7 @@ def native_route(request):
         request.path == NATIVE_ROUTE_PATH
         or request.path.startswith(NATIVE_RECEIPT_PATH)
         or request.path == NATIVE_USAGE_PATH
+        or request.path == NATIVE_CAPABILITIES_PATH
     )
 
 
@@ -1733,6 +1950,18 @@ def create_app(settings, observability=None):
     async def native_usage(request):
         return await request.app[GATEWAY].native_usage(request)
 
+    async def capabilities(request):
+        return await request.app[GATEWAY].capabilities(request)
+
+    async def native_capabilities(request):
+        return await request.app[GATEWAY].capabilities(request, True)
+
+    async def cancel(request):
+        return await request.app[GATEWAY].cancel(request)
+
+    async def native_cancel(request):
+        return await request.app[GATEWAY].cancel(request, True)
+
     async def unsupported(request):
         request.app[GATEWAY].authenticate(request)
         # The terminal is recorded here, with this refusal's own code, before the middleware's
@@ -1790,6 +2019,8 @@ def create_app(settings, observability=None):
             "/internal/v1/provider-self-service/{operation}", observed(provider_management)
         )
     app.router.add_get("/internal/v1/model-requests/{request_id}", observed(receipt))
+    app.router.add_post("/internal/v1/model-requests/{request_id}/cancel", observed(cancel))
+    app.router.add_get(CAPABILITIES_PATH, observed(capabilities))
     app.router.add_get(USAGE_PATH, observed(usage))
     # Neither probe is wrapped: a probe writes no event, takes no capacity and touches no
     # dependency, and that is a property of the wiring rather than of the handler body.
@@ -1800,11 +2031,14 @@ def create_app(settings, observability=None):
     if settings.native_enabled:
         app.router.add_post(NATIVE_ROUTE_PATH, observed(native_responses))
         app.router.add_get(NATIVE_RECEIPT_PATH + "{request_id}", observed(native_receipt))
+        app.router.add_post(NATIVE_RECEIPT_PATH + "{request_id}/cancel", observed(native_cancel))
+        app.router.add_get(NATIVE_CAPABILITIES_PATH, observed(native_capabilities))
         app.router.add_get(NATIVE_USAGE_PATH, observed(native_usage))
     else:
         # Native stays closed until a deployment explicitly enables it.
         app.router.add_route("*", NATIVE_ROUTE_PATH, observed(native_disabled))
         app.router.add_route("*", NATIVE_USAGE_PATH, observed(native_disabled))
+        app.router.add_route("*", NATIVE_CAPABILITIES_PATH, observed(native_disabled))
     return app
 
 

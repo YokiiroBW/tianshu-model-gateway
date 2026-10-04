@@ -16,7 +16,7 @@ HTTP JSON 错误保留状态和安全正文；原生 failed/incomplete JSON/SSE 
 
 支持显式 model、文字与内联历史 input、function/custom 工具描述与调用输出、原生 reasoning/加密内容、未知字段。工具 schema 和业务字符串中的 file_id 不当作远端引用。
 
-已知远端引用按原生位置拒绝：previous_response_id/conversation/prompt、缓存 comparison_response_id、item_reference（含省略 type 的 ID 引用）、文件/容器引用等。后台、文件/图像/音频、内置远程工具、WebSocket 与 retrieve/delete/cancel/compact 等生命周期入口不实现。store 保持客户端选择；stateless 表示不消费服务器引用，不表示网关强制供应商不存储。其他供应商与 embedding 不在本块范围。
+已知远端引用按原生位置拒绝：previous_response_id/conversation/prompt、缓存 comparison_response_id、item_reference（含省略 type 的 ID 引用）、文件/容器引用等。C2 支持 inline input_image/image_url 并保持原生内容，不抓取图片；文件/音频、后台、内置远程工具、WebSocket 与供应商 retrieve/delete/cancel/compact 等生命周期入口仍不实现。Gateway 的本地拥有者取消关闭当前连接，不调用供应商生命周期接口。store 保持客户端选择；stateless 表示不消费服务器引用，不表示网关强制供应商不存储。其他供应商与 embedding 不在本块范围。
 
 接线现状：根独立合同已由协调者发布（`contracts/model-protocol/v1` 1.0.0），网关消费该包并已注册 `POST /v1/responses` 与 `GET /internal/v1/native-model-requests/{request_id}`，但默认关闭、只有部署显式启用才注册。网关验证认证 principal/namespace/provider/model/native 版本与有效期/撤销/绑定关系，并生成 route_context 与 native 回执。平台唯一 Models owner 的 native 快照生产者仍待其增量实现：正式发布状态在根包中仍为 `runtime_disabled_until_joint_acceptance`，本卡不声明联合验收或生产可用。
 

@@ -1417,6 +1417,7 @@ class ScheduledScenarios:
         )
         async with await duplicate as refused:
             self.assertEqual(refused.status, 400)
+            self.assertEqual((await refused.json())["code"], "invalid_input")
         self.assertEqual(self.scheduler.waiting, 1)
         self.assertEqual(self.services.call_count(), self.global_limit)
         await self.release_held([*held, *blockers, first])

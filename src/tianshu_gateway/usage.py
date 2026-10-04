@@ -54,7 +54,7 @@ LATENCY_COLUMNS = (
 )
 SUCCEEDED_REASONS = frozenset({"completed", "response_completed"})
 FAILED_REASONS = frozenset({"response_failed"})
-CANCELLED_REASONS = frozenset({"cancelled_unknown"})
+CANCELLED_REASONS = frozenset({"cancelled_unknown", "cancelled_before_start"})
 
 
 def source_usage(row):
@@ -274,7 +274,7 @@ class Selection:
                 "reason='response_failed' OR (reason='upstream_http_error' "
                 "AND upstream_status>=400 AND upstream_status<500)",
             ),
-            ("cancelled", "reason='cancelled_unknown'"),
+            ("cancelled", "reason IN ('cancelled_unknown','cancelled_before_start')"),
         )
         select = ", ".join(f"SUM({sql}) AS {name}" for name, sql in fields)
         row = self.scalar(

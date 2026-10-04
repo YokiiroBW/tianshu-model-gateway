@@ -91,7 +91,10 @@ def validate_request(raw):
                 raise Rejected("state_reference_unsupported", 409)
             if any(item.get(k) is not None for k in ("file_id", "container_id", "response_id")):
                 raise Rejected("state_reference_unsupported", 409)
-            if item.get("type") in {"input_file", "input_image", "input_audio", "computer_call"}:
+            if item.get("type") == "input_image":
+                if not isinstance(item.get("image_url"), str) or not item["image_url"]:
+                    raise Rejected()
+            if item.get("type") in {"input_file", "input_audio", "computer_call"}:
                 raise Rejected("unsupported_operation", 501)
             items(item.get("content"))
             if item.get("type") in {"function_call_output", "custom_tool_call_output"}:
@@ -145,6 +148,7 @@ class ResponsesObserver(StreamObserver):
     def dispatch(self):
         if not self.data:
             return
+        self.event_count += 1
         if self.first_event_ms is None:
             self.first_event_ms = self.elapsed_ms()
         try:
@@ -200,6 +204,8 @@ async def send_responses(
     validate_response=None,
     validate_receipt=None,
     on_first_output=None,
+    execution=None,
+    integration_headers=None,
 ):
     """One HTTP attempt with asynchronous sink/backpressure and native-ledger observation.
 
@@ -256,7 +262,7 @@ async def send_responses(
         raise Rejected("forbidden", 403)
     secrets = (*secrets, credential)
     receipt.update(outcome="unknown", usage=None, native_usage=None, usage_complete=False)
-    receipt = redact(receipt, secrets)
+    receipt.update(redact(receipt, secrets))
     upstream_status = None
     reason = "transport_unknown"
     started = time.monotonic()
@@ -265,6 +271,20 @@ async def send_responses(
     # True once a complete upstream response has been read and examined, which is what
     # separates "the provider reported no usage" from "no usage could be observed".
     inspected = False
+
+    def checkpoint(received=0, forwarded=0, force=False):
+        if execution is None:
+            return
+        execution.observe(received=received, forwarded=forwarded, observer=observer)
+        record_observation(receipt, observer, False)
+        receipt["execution"] = execution.snapshot()
+        execution.receipt = receipt
+        if force or execution.checkpoint_due():
+            safe = redact(receipt, secrets)
+            if validate_receipt is not None:
+                validate_receipt(safe)
+            ledger.native_progress(safe)
+
     try:
         async with asyncio.timeout(timeout):
             async with session.post(
@@ -275,6 +295,7 @@ async def send_responses(
                     "Authorization": "Bearer " + credential,
                     "Accept": "text/event-stream" if body.get("stream") else "application/json",
                     "Accept-Encoding": "identity",
+                    **(integration_headers or {}),
                 },
                 allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=timeout),
@@ -288,6 +309,8 @@ async def send_responses(
                 guard = SecretGuard(secrets)
                 if not 200 <= upstream.status < 300:
                     raw = await read_limited(upstream.content, max_response_bytes)
+                    if execution:
+                        execution.observe(received=len(raw))
                     guard.feed(raw, final=True)
                     # Native JSON errors are preserved; no upstream cookies/location/credentials.
                     if upstream.content_type != "application/json":
@@ -303,12 +326,17 @@ async def send_responses(
                         raise Rejected("result_unknown", 502, "unknown")
                     await start_response(upstream.status, "text/event-stream")
                     async for chunk in upstream.content.iter_any():
+                        if execution:
+                            execution.observe(received=len(chunk))
+                            if execution.received_bytes > max_response_bytes:
+                                raise Rejected("result_unknown", 502, "unknown")
                         observer.feed(chunk)
                         if observer.first_output_ms is not None:
                             note_output()
                         safe = guard.feed(chunk)
                         if safe:
                             await write(safe)
+                        checkpoint(forwarded=len(safe))
                     observer.end()
                     inspected = True
                     # The upstream stream ended by itself, so every byte belongs downstream.
@@ -319,10 +347,13 @@ async def send_responses(
                     tail = guard.feed(b"", final=True)
                     if tail:
                         await write(tail)
+                        checkpoint(forwarded=len(tail))
                 else:
                     if upstream.content_type != "application/json":
                         raise Rejected("result_unknown", 502, "unknown")
                     raw = await read_limited(upstream.content, max_response_bytes)
+                    if execution:
+                        execution.observe(received=len(raw))
                     guard.feed(raw, final=True)
                     native = loads(raw)
                     if isinstance(native, dict):
@@ -339,6 +370,9 @@ async def send_responses(
                         pass
                     await start_response(upstream.status, "application/json")
                     await write(raw)
+                    if execution:
+                        execution.output_observed = observer.status in TERMINALS
+                        execution.snapshot()
                     # A single JSON body is its own first output.
                     note_output()
                 if observer.complete:
@@ -359,6 +393,9 @@ async def send_responses(
         raise Rejected("result_unknown", 502, "unknown") from None
     finally:
         record_observation(receipt, observer, complete)
+        if execution:
+            execution.observe(observer=observer)
+            receipt["execution"] = execution.finish(reason, receipt["outcome"])
         receipt["observed_at"] = utcnow().isoformat().replace("+00:00", "Z")
         safe_receipt = redact(receipt, secrets)
         if validate_receipt is not None:

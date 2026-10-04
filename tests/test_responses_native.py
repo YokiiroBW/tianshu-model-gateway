@@ -997,7 +997,7 @@ class NativeHttpTests(unittest.IsolatedAsyncioTestCase):
                 409,
             ),
             (
-                {"input": [{"role": "user", "content": [{"type": "input_image"}]}]},
+                {"input": [{"role": "user", "content": [{"type": "input_audio"}]}]},
                 "unsupported_operation",
                 501,
             ),
