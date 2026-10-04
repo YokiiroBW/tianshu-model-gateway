@@ -6,6 +6,7 @@ TargetPolicy is deployment-owned; provider input cannot supply it or a TLS conte
 """
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import socket
@@ -21,11 +22,38 @@ from .contracts import Rejected, loads
 from .routing import SecretGuard
 
 
+PROVIDER_SESSION_HEADER = "X-Tianshu-Provider-Session"
+
+
+def provider_headers(base_url, session_id):
+    """OpenCode routing metadata only; it never selects or authorizes a provider."""
+    target = urlsplit(base_url)
+    if not (
+        target.scheme == "https"
+        and target.hostname == "opencode.ai"
+        and target.port in {None, 443}
+        and target.path.rstrip("/") in {"/zen/v1", "/zen/go/v1"}
+    ):
+        return {}
+    if not (
+        isinstance(session_id, str)
+        and 0 < len(session_id) <= 128
+        and all(32 < ord(c) < 127 for c in session_id)
+    ):
+        raise ProviderFailure("invalid_request")
+    opaque = hashlib.sha256(("tianshu-opencode-session:" + session_id).encode()).hexdigest()
+    return {
+        "User-Agent": "tianshu-model-gateway/0.1.0",
+        "x-opencode-session": "tianshu-" + opaque,
+    }
+
+
 class ProviderFailure(Exception):
     """Fixed public reason only; upstream bodies, addresses and keys never escape."""
 
-    def __init__(self, code, outcome="not_started"):
+    def __init__(self, code, outcome="not_started", *, upstream_status=None, upstream_reason=None):
         self.code, self.outcome = code, outcome
+        self.upstream_status, self.upstream_reason = upstream_status, upstream_reason
         super().__init__(code)
 
 
@@ -261,6 +289,13 @@ class OpenAIAdapter:
         ):
             raise ProviderFailure("invalid_credential")
         base, host, port = checked_base(context.base_url, connection_type)
+        headers = {
+            "Authorization": "Bearer " + key,
+            "Accept-Encoding": "identity",
+            **provider_headers(
+                base, "test:" + hashlib.sha256(context.provider_id.encode()).hexdigest()
+            ),
+        }
         started = False
         try:
             async with asyncio.timeout(self.timeout_seconds):
@@ -297,7 +332,7 @@ class OpenAIAdapter:
                         "GET" if body is None else "POST",
                         base + "/" + operation,
                         json=body,
-                        headers={"Authorization": "Bearer " + key, "Accept-Encoding": "identity"},
+                        headers=headers,
                         allow_redirects=False,
                     ) as response:
                         status = response.status
@@ -318,9 +353,10 @@ class OpenAIAdapter:
                                 if 300 <= status < 400
                                 else "rate_limited"
                                 if status == 429
-                                else "upstream_failed"
+                                else "upstream_rejected"
                             )
-                            if body is not None and status in {400, 404}:
+                            reason = None
+                            if body is not None:
                                 # Only an explicit machine code proves a missing model.
                                 # An arbitrary 404 may instead mean a wrong base path.
                                 try:
@@ -332,10 +368,15 @@ class OpenAIAdapter:
                                     ):
                                         if error["error"].get("code") == "model_not_found":
                                             code = "model_not_found"
+                                        if error["error"].get("type") == "MissingSessionID":
+                                            reason = "missing_session_id"
                                 except Rejected:
                                     pass
                             raise ProviderFailure(
-                                code, "unknown" if body is not None else "not_started"
+                                code,
+                                "unknown" if body is not None else "not_started",
+                                upstream_status=status,
+                                upstream_reason=reason,
                             )
                         raw = await read_limited(response.content, self.response_limit)
                         SecretGuard((key,)).feed(raw, final=True)

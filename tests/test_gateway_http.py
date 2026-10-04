@@ -27,10 +27,31 @@ from gateway_fixtures import (
     start_http,
 )
 from tianshu_gateway.config import ClientGrant, utcnow
+from tianshu_gateway.provider_adapter import PROVIDER_SESSION_HEADER, provider_headers
 from tianshu_gateway.server import GATEWAY, Settings, create_app
 
 
 class GatewayHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_session_metadata_reaches_only_opencode_header(self):
+        def integration(base, session):
+            return provider_headers("https://opencode.ai/zen/go/v1", session)
+
+        with patch("tianshu_gateway.server.provider_headers", side_effect=integration):
+            for _ in range(2):
+                headers = {**self.headers(), PROVIDER_SESSION_HEADER: "synthetic-stable-session"}
+                async with await self.post(headers=headers) as response:
+                    self.assertEqual(response.status, 200)
+                    await response.read()
+            async with await self.post() as response:
+                self.assertEqual(response.status, 400)
+                self.assertEqual((await response.json())["code"], "invalid_input")
+        self.assertEqual(len(self.services.calls), 2)
+        first = self.services.calls[0][1]
+        second = self.services.calls[1][1]
+        self.assertEqual(first["x-opencode-session"], second["x-opencode-session"])
+        self.assertEqual(first["User-Agent"], "tianshu-model-gateway/0.1.0")
+        self.assertNotIn(PROVIDER_SESSION_HEADER, first)
+
     async def asyncSetUp(self):
         self.environment = patch.dict(os.environ, SECRETS)
         self.environment.start()

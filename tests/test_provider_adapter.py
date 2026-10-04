@@ -5,6 +5,7 @@ import ipaddress
 import ssl
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from aiohttp import web
 
@@ -15,6 +16,7 @@ from tianshu_gateway.provider_adapter import (
     ProviderFailure,
     TargetPolicy,
     checked_base,
+    provider_headers,
 )
 
 
@@ -24,6 +26,28 @@ class FixtureTargets:
 
 
 class AddressTests(unittest.TestCase):
+    def test_opencode_headers_are_stable_private_and_only_for_exact_endpoints(self):
+        for path in ("/zen/v1", "/zen/go/v1"):
+            headers = provider_headers("https://opencode.ai" + path, "opaque-conversation")
+            self.assertEqual(headers["User-Agent"], "tianshu-model-gateway/0.1.0")
+            self.assertEqual(
+                headers, provider_headers("https://opencode.ai" + path, "opaque-conversation")
+            )
+            self.assertNotIn("opaque-conversation", headers["x-opencode-session"])
+            self.assertNotEqual(
+                headers, provider_headers("https://opencode.ai" + path, "different-conversation")
+            )
+            for invalid in (None, "", "line\r\nbreak", "x" * 129):
+                with self.assertRaises(ProviderFailure):
+                    provider_headers("https://opencode.ai" + path, invalid)
+        for base in (
+            "https://other.invalid/zen/go/v1",
+            "https://opencode.ai.other.invalid/zen/go/v1",
+            "http://opencode.ai/zen/go/v1",
+            "https://opencode.ai/other/v1",
+        ):
+            self.assertEqual(provider_headers(base, None), {})
+
     def test_production_addresses(self):
         policy = TargetPolicy(("10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16"))
         for address in (
@@ -108,6 +132,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.requests = []
+        self.integration_headers = []
         self.mode = "normal"
         self.seen = asyncio.Event()
         app = web.Application()
@@ -139,6 +164,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
     async def handle(self, request):
         body = await request.json() if request.method == "POST" else None
         self.requests.append((request.method, request.path, request.headers["Authorization"], body))
+        self.integration_headers.append(dict(request.headers))
         self.seen.set()
         if self.mode == "slow":
             await asyncio.sleep(5)
@@ -157,6 +183,16 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             return web.json_response({"error": {"code": "model_not_found"}}, status=404)
         if self.mode == "empty-reply":
             return web.json_response({"choices": []})
+        if self.mode == "missing-session":
+            return web.json_response(
+                {
+                    "error": {
+                        "type": "MissingSessionID",
+                        "message": request.headers["Authorization"],
+                    }
+                },
+                status=400,
+            )
         if self.mode == "bad-finish":
             return web.json_response(
                 {"choices": [{"message": {"content": "OK"}, "finish_reason": []}]}
@@ -231,6 +267,34 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertNotIn("fixture-key", repr(self.context()))
+
+    async def test_short_probe_sends_opencode_integration_headers_in_one_request(self):
+        # The endpoint matcher is separately tested above; this local TLS seam tests transport.
+        with patch(
+            "tianshu_gateway.provider_adapter.provider_headers",
+            side_effect=lambda base, session: provider_headers(
+                "https://opencode.ai/zen/go/v1", session
+            ),
+        ):
+            result = await self.adapter.test_reply(self.context())
+        self.assertTrue(result["reply_verified"])
+        self.assertEqual(len(self.requests), 1)
+
+        headers = self.integration_headers[0]
+        self.assertEqual(headers["User-Agent"], "tianshu-model-gateway/0.1.0")
+        self.assertTrue(headers["x-opencode-session"].startswith("tianshu-"))
+
+    async def test_missing_session_refusal_retains_only_fixed_diagnostic(self):
+        self.mode = "missing-session"
+        with self.assertRaises(ProviderFailure) as caught:
+            await self.adapter.test_reply(self.context())
+        failure = caught.exception
+        self.assertEqual(
+            (failure.code, failure.upstream_status, failure.upstream_reason),
+            ("upstream_rejected", 400, "missing_session_id"),
+        )
+        self.assertNotIn("fixture-key", str(failure))
+        self.assertEqual(len(self.requests), 1)
 
     async def test_reasoning_budget_reaches_a_final_reply_in_one_request(self):
         self.mode = "reasoning-budget"
@@ -313,7 +377,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             (404, "models_unsupported"),
             (405, "models_unsupported"),
             (429, "rate_limited"),
-            (500, "upstream_failed"),
+            (500, "upstream_rejected"),
         ):
             self.mode = status
             with self.assertRaises(ProviderFailure) as caught:

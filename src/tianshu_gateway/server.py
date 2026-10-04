@@ -1,6 +1,7 @@
 """Actual aiohttp transport with one attempt, cancellation and bounded streaming."""
 
 import asyncio
+import json
 import hmac
 import logging
 import time
@@ -53,7 +54,14 @@ from .observability import (
 from .observability import events as observation_events
 from .observability import health as probe_health
 from .observability.events import load_contract
-from .provider_adapter import ExecutionContext, OpenAIAdapter, ProviderFailure, TargetPolicy
+from .provider_adapter import (
+    PROVIDER_SESSION_HEADER,
+    ExecutionContext,
+    OpenAIAdapter,
+    ProviderFailure,
+    TargetPolicy,
+    provider_headers,
+)
 from .provider_runtime import ProviderRuntimeSource
 from .origin_renewal import (
     CurrentCache,
@@ -430,9 +438,21 @@ class Gateway:
                 "model_not_found": ("model_not_found", 502),
                 "timeout": ("timed_out", 504),
                 "upstream_failed": ("connection_failed", 503),
+                "upstream_rejected": ("upstream_rejected", 502),
+                "rate_limited": ("upstream_rejected", 502),
             }
             code, status = mapping.get(failure.code, ("upstream_invalid", 502))
-            raise Rejected(code, status, failure.outcome) from None
+            refusal = Rejected(code, status, failure.outcome)
+            response = error_response(refusal, request[REQUEST_ID])
+            document = loads(response.body)
+            if failure.upstream_status is not None:
+                document["provider_diagnostic"] = {
+                    "http_status": failure.upstream_status,
+                    "reason": failure.upstream_reason,
+                }
+                response.body = json.dumps(document).encode()
+            self.record_event(request, "request.rejected", error_code="dependency_unavailable")
+            return response
         return web.json_response(result, headers={"Cache-Control": "no-store"})
 
     def dynamic_config(self, source):
@@ -919,6 +939,10 @@ class Gateway:
         effective, provider, binding, receipt = prepare(
             self.contracts, body, config, route_grant, request_id, grant.internal
         )
+        try:
+            provider_headers(provider["base_url"], request.headers.get(PROVIDER_SESSION_HEADER))
+        except ProviderFailure:
+            raise Rejected("invalid_input", 400) from None
         if dynamic:
             credential = source["api_key"]
         else:
@@ -1194,11 +1218,18 @@ class Gateway:
         *,
         session=None,
     ):
+        try:
+            integration_headers = provider_headers(
+                provider["base_url"], request.headers.get(PROVIDER_SESSION_HEADER)
+            )
+        except ProviderFailure:
+            raise Rejected("invalid_input", 400) from None
         headers = {
             "Content-Type": "application/json",
             "Authorization": "Bearer " + credential,
             "Accept": "text/event-stream" if body.get("stream") else "application/json",
             "Accept-Encoding": "identity",
+            **integration_headers,
         }
         if "OpenAI-Beta" in request.headers:
             beta = request.headers["OpenAI-Beta"]
