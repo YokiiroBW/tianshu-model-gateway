@@ -201,6 +201,7 @@ class Settings:
     observability: ObservabilitySettings | None = None
     platform_origin_renewal: bool = False
     provider_management_credential_ref: str | None = None
+    memory_retrieval_credential_ref: str | None = None
     provider_self_service: bool = False
     provider_nat64_prefixes: tuple[str, ...] = ()
 
@@ -231,6 +232,16 @@ class Settings:
                 or ref in {client.credential_ref for client in self.native_clients}
             ):
                 raise ValueError("dedicated provider management credential required")
+        if self.memory_retrieval_credential_ref is not None:
+            ref = self.memory_retrieval_credential_ref
+            if (
+                not isinstance(ref, str)
+                or ref not in self.secret_references
+                or ref in {self.platform_credential_ref, self.provider_management_credential_ref}
+                or ref in {client.credential_ref for client in self.clients}
+                or ref in {client.credential_ref for client in self.native_clients}
+            ):
+                raise ValueError("dedicated memory retrieval credential required")
         validate_origin_renewal(self.platform_origin_renewal, self.platform_base_url)
         if not self.clients and not self.native_clients:
             raise ValueError("authenticated client registration required")
@@ -381,6 +392,7 @@ class Gateway:
         self.active = 0
         self.provider_active = {}
         self.executions = Executions()
+        self.retrieval_slots = asyncio.Semaphore(4)
         self.provider_adapter = OpenAIAdapter(
             policy=TargetPolicy(nat64_prefixes=("64:ff9b::/96", *settings.provider_nat64_prefixes))
         )
@@ -406,8 +418,11 @@ class Gateway:
             raise Rejected("unauthorized", 401)
         if request.content_type != "application/json" or request.query_string:
             raise Rejected()
-        raw = await read_limited(request.content, 12288)
+        operation = request.match_info["operation"]
+        retrieval = operation in {"embed", "rerank"}
+        raw = await read_limited(request.content, 1048576 if retrieval else 12288)
         body = loads(raw)
+        payload = body.pop("payload", None) if isinstance(body, dict) and retrieval else None
         if not isinstance(body, dict) or set(body) != {
             "provider_id",
             "revision",
@@ -427,7 +442,12 @@ class Gateway:
         context = ExecutionContext(**body)
         operation = request.match_info["operation"]
         try:
-            if operation == "models":
+            if retrieval:
+                from .retrieval_models import execute
+
+                async with self.retrieval_slots:
+                    result = await execute(self.provider_adapter, context, operation, payload)
+            elif operation == "models":
                 result = {"models": list(await self.provider_adapter.models(context))}
             elif operation == "test":
                 verdict = await self.provider_adapter.test_reply(context)
@@ -2012,7 +2032,14 @@ def create_app(settings, observability=None):
             headers=dict(NO_STORE),
         )
 
+    async def memory_retrieval(request):
+        from .retrieval_runtime import handle
+
+        return await handle(request.app[GATEWAY], request)
+
     app.cleanup_ctx.append(resources)
+    if settings.memory_retrieval_credential_ref is not None:
+        app.router.add_post("/internal/v1/memory-retrieval/execute", observed(memory_retrieval))
     app.router.add_post("/v1/chat/completions", observed(chat))
     if settings.provider_management_credential_ref is not None:
         app.router.add_post(
