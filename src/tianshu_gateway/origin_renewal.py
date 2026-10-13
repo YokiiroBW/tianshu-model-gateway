@@ -68,6 +68,8 @@ class OriginRenewal:
         self.deadline = self.renew_at = 0.0
         self.closed = False
         self.failure = None
+        self.unavailable = False
+        self.retry_at, self.retry_delay = 0.0, 0.25
         self._flight = self._worker = None
 
     def deny(self, code="forbidden", status=403):
@@ -91,12 +93,15 @@ class OriginRenewal:
     def check(self):
         """Read-only gate, including after any wait and on every cache access."""
         self._available()
-        if self.expires_at is None:
+        if self.expires_at is None or self.unavailable:
             raise Rejected("dependency_unavailable", 503)
 
     async def ensure(self):
         self._available()
-        if self.expires_at is not None and time.monotonic() < self.renew_at:
+        now = time.monotonic()
+        if self.unavailable and now < self.retry_at:
+            raise Rejected("dependency_unavailable", 503)
+        if self.expires_at is not None and not self.unavailable and now < self.renew_at:
             return
         if self._flight is None or self._flight.done():
             self._flight = asyncio.create_task(self._renew(), name="model-origin-renewal-flight")
@@ -113,13 +118,16 @@ class OriginRenewal:
             self._worker = asyncio.create_task(self._run(), name="model-origin-renewal-worker")
 
     async def _run(self):
-        try:
-            while not self.closed:
-                await asyncio.sleep(max(0, self.renew_at - time.monotonic()))
+        while not self.closed:
+            wake_at = self.retry_at if self.unavailable else self.renew_at
+            await asyncio.sleep(max(0, wake_at - time.monotonic()))
+            try:
                 await self.ensure()
-        except Rejected:
-            # Failed closed until explicit re-bootstrap/restart. No background issuance loop.
-            return
+            except Rejected:
+                # Only a transport outage with already confirmed, unexpired authority can
+                # continue. No bootstrap, replacement reference or invalid response retry.
+                if self.failure is not None or not self.unavailable or self.closed:
+                    return
 
     async def _renew(self):
         # Even all retries share a three-second round and the current authority's deadline.
@@ -139,13 +147,29 @@ class OriginRenewal:
                         return
                     except SourceUnavailable:
                         self._available()
+                        self.unavailable = True
                         if attempt == 2:
                             raise
                         remaining = stop - time.monotonic()
                         if remaining <= 0:
                             raise TimeoutError() from None
                         await asyncio.sleep(min((0.25, 0.5)[attempt], remaining))
-        except (TimeoutError, Rejected):
+        except (SourceUnavailable, TimeoutError):
+            self._available()
+            if self.expires_at is None:
+                self.deny("dependency_unavailable", 503)
+            else:
+                # Keep the old deadline solely as a retry ceiling, never as permission to
+                # serve cached configuration. Business waiters share the worker's backoff.
+                self.unavailable = True
+                now = time.monotonic()
+                self.retry_at = min(
+                    now + self.retry_delay, self.deadline, now + self.expires_at - time.time()
+                )
+                self.retry_delay = min(2.0, self.retry_delay * 2)
+            # SourceUnavailable permits cache fallback elsewhere; never expose that here.
+            raise Rejected("dependency_unavailable", 503) from None
+        except Rejected:
             # If the deadline crossed, a late response must not revive local authority.
             self._available()
             self.deny("dependency_unavailable", 503)
@@ -180,9 +204,6 @@ class OriginRenewal:
                 expires = validate_response(loads(raw), body)
         except (aiohttp.ClientError, TimeoutError):
             raise SourceUnavailable() from None
-        self._available()
-        if time.monotonic() >= stop:
-            raise TimeoutError()
         # Never grant more than the producer's maximum 3600s. Subtract the whole round trip
         # conservatively; wall-clock rollback cannot extend the monotonic authority deadline.
         remaining = expires - time.time()
@@ -191,8 +212,14 @@ class OriginRenewal:
         deadline = started_mono + remaining
         if deadline <= time.monotonic():
             raise Rejected("dependency_unavailable", 503)
+        # Recheck the original authority immediately before replacing its deadlines.
+        self._available()
+        if time.monotonic() >= stop:
+            raise TimeoutError()
         previous = self.expires_at
         self.expires_at, self.deadline = expires, deadline
+        self.unavailable = False
+        self.retry_at, self.retry_delay = 0.0, 0.25
         # Half of the remaining lifetime, at most 30s between checks, with no minimum that
         # could put a short TTL over its ceiling. No child references are ever accepted.
         self.renew_at = time.monotonic() + min(30.0, (deadline - time.monotonic()) / 2)

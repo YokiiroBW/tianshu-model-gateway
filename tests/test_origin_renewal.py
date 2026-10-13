@@ -10,17 +10,19 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import aiohttp
 from aiohttp import web
 
 from gateway_fixtures import WORKSPACE
 from observability_fixtures import start_tls, write_tls
-from tianshu_gateway.config import EnvSecrets, RegisteredTargets
+from tianshu_gateway.config import EnvSecrets, RegisteredTargets, SourceUnavailable
 from tianshu_gateway.contracts import Rejected
 from tianshu_gateway.origin_renewal import (
     PATH,
+    CurrentCache,
     OriginRenewal,
     validate_request,
     validate_response,
@@ -81,6 +83,7 @@ class OriginTransportTests(unittest.IsolatedAsyncioTestCase):
         self.delay = 0
         self.release = None
         self.raw = None
+        self.headers = {}
         self.mutate = lambda body: body
         self.disconnects = 0
         self.stream = False
@@ -138,7 +141,10 @@ class OriginTransportTests(unittest.IsolatedAsyncioTestCase):
             return response
         if self.raw is not None:
             return web.Response(body=self.raw, content_type="application/json")
-        return web.json_response(self.mutate({**body, "expires_at": utc(time.time() + self.ttl)}))
+        return web.json_response(
+            self.mutate({**body, "expires_at": utc(time.time() + self.ttl)}),
+            headers=self.headers,
+        )
 
     async def test_single_flight_waiter_cancel_and_shared_success(self):
         self.release = asyncio.Event()
@@ -208,6 +214,150 @@ class OriginTransportTests(unittest.IsolatedAsyncioTestCase):
             await self.origin.ensure()
         self.assertEqual(len(self.calls), 3)
 
+    async def test_confirmed_origin_recovers_after_failed_round_without_cache_fallback(self):
+        for status in (429, 503, "disconnect"):
+            with self.subTest(status=status):
+                origin = self.manager()
+                await origin.ensure()
+                initial = origin.expires_at
+                origin.renew_at = 0
+                before = len(self.calls)
+                if status == "disconnect":
+                    self.disconnects = 3
+                else:
+                    self.status = status
+                with self.assertRaises(Rejected) as failure:
+                    await origin.ensure()
+                self.assertEqual(failure.exception.status, 503)
+                self.assertNotIsInstance(failure.exception, SourceUnavailable)
+                self.assertEqual(len(self.calls), before + 3)
+                self.assertIsNone(origin.failure)
+                self.assertEqual(origin.expires_at, initial)
+
+                # Read-only probes and a warm cache cannot authorize stale configuration.
+                cache = SimpleNamespace(
+                    get=AsyncMock(return_value="verified-configuration"),
+                    source=SimpleNamespace(fetch=AsyncMock()),
+                )
+                current = CurrentCache(cache, origin)
+                for _ in range(3):
+                    with self.assertRaises(Rejected):
+                        origin.check()
+                    with self.assertRaises(Rejected):
+                        await current.get(7)
+                cache.get.assert_not_awaited()
+                cache.source.source.fetch.assert_not_awaited()
+                self.assertEqual(len(self.calls), before + 3)
+
+                self.status = 200
+                await asyncio.sleep(0.26)
+                self.assertEqual(await current.get(7), "verified-configuration")
+                cache.get.assert_awaited_once_with(7)
+                self.assertEqual(len(self.calls), before + 4)
+                self.assertGreater(origin.expires_at, initial)
+                self.assertEqual(origin.ref, REF)
+                self.assertEqual(origin.retry_delay, 0.25)
+                origin.check()
+
+    async def test_worker_recovers_after_whole_round_timeout_with_same_authority(self):
+        await self.origin.start()
+        initial = self.origin.expires_at
+        self.origin.renew_at = 0
+        self.delay = 3.2
+        async with asyncio.timeout(4):
+            while not (self.origin.unavailable and self.origin._flight.done()):
+                await asyncio.sleep(0.005)
+        self.assertIsNone(self.origin.failure)
+        self.assertEqual(self.origin.expires_at, initial)
+        self.assertFalse(self.origin._worker.done())
+        with self.assertRaises(Rejected):
+            self.origin.check()
+        self.delay = 0
+        async with asyncio.timeout(1):
+            while self.origin.unavailable:
+                await asyncio.sleep(0.005)
+        self.origin.check()
+        self.assertGreater(self.origin.expires_at, initial)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual({call["assertion_ref"] for call in self.calls}, {REF})
+
+    async def test_worker_and_concurrent_business_waiters_share_recovery_flight(self):
+        await self.origin.start()
+        self.origin.renew_at = 0
+        self.status = 503
+        async with asyncio.timeout(1.5):
+            while not (self.origin.unavailable and self.origin._flight.done()):
+                await asyncio.sleep(0.005)
+        self.assertEqual(len(self.calls), 4)
+        self.status = 200
+        self.release = asyncio.Event()
+        async with asyncio.timeout(1):
+            while len(self.calls) < 5:
+                await asyncio.sleep(0.005)
+        tasks = [asyncio.create_task(self.origin.ensure()) for _ in range(20)]
+        await asyncio.sleep(0.02)
+        for task in tasks[:10]:
+            task.cancel()
+        await asyncio.gather(*tasks[:10], return_exceptions=True)
+        self.assertEqual(len(self.calls), 5)
+        with self.assertRaises(Rejected):
+            self.origin.check()
+        self.release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks[10:]), 1)
+        self.origin.check()
+        self.assertEqual(len(self.calls), 5)
+        self.assertFalse(self.origin._worker.done())
+
+    async def test_continuous_failures_cross_original_ttl_and_never_revive(self):
+        self.ttl = 1.5
+        await self.origin.start()
+        initial = self.origin.expires_at
+        self.origin.renew_at = 0
+        self.status = 503
+        async with asyncio.timeout(2.5):
+            while not self.origin._worker.done():
+                await asyncio.sleep(0.005)
+        self.assertEqual(self.origin.failure, ("forbidden", 403))
+        self.assertEqual(self.origin.expires_at, initial)
+        count = len(self.calls)
+        self.status = 200
+        for _ in range(3):
+            with self.assertRaises(Rejected):
+                await self.origin.ensure()
+        self.assertEqual(len(self.calls), count)
+
+    async def test_close_during_retry_backoff_cancels_worker_promptly(self):
+        await self.origin.start()
+        self.origin.renew_at = 0
+        self.status = 503
+        async with asyncio.timeout(1.5):
+            while not (self.origin.unavailable and self.origin._flight.done()):
+                await asyncio.sleep(0.005)
+        count = len(self.calls)
+        await asyncio.wait_for(self.origin.close(), 0.5)
+        self.assertTrue(self.origin._worker.done() and self.origin._flight.done())
+        with self.assertRaises(Rejected):
+            await self.origin.ensure()
+        self.assertEqual(len(self.calls), count)
+
+    async def test_confirmed_origin_hard_auth_rejection_remains_terminal(self):
+        for status in (401, 403, 410):
+            with self.subTest(status=status):
+                origin = self.manager()
+                await origin.ensure()
+                initial = origin.expires_at
+                origin.renew_at = 0
+                self.status = status
+                before = len(self.calls)
+                with self.assertRaises(Rejected):
+                    await origin.ensure()
+                self.status = 200
+                with self.assertRaises(Rejected):
+                    await origin.ensure()
+                self.assertEqual(len(self.calls), before + 1)
+                self.assertEqual(origin.expires_at, initial)
+                self.assertEqual(origin.failure, ("forbidden", 403))
+
     async def test_maximum_valid_ttl_is_accepted_after_real_server_processing_time(self):
         self.ttl = 3600
         self.delay = 0.05
@@ -227,10 +377,23 @@ class OriginTransportTests(unittest.IsolatedAsyncioTestCase):
             lambda b: {**b, "schema_version": True},
         )
         for change in changes:
-            self.mutate = change
-            origin = self.manager()
-            with self.subTest(change=change), self.assertRaises(Rejected):
-                await origin.ensure()
+            for confirmed in (False, True):
+                with self.subTest(change=change, confirmed=confirmed):
+                    self.mutate = lambda body: body
+                    origin = self.manager()
+                    if confirmed:
+                        await origin.ensure()
+                        origin.renew_at = 0
+                    initial = origin.expires_at
+                    self.mutate = change
+                    before = len(self.calls)
+                    with self.assertRaises(Rejected):
+                        await origin.ensure()
+                    self.mutate = lambda body: body
+                    with self.assertRaises(Rejected):
+                        await origin.ensure()
+                    self.assertEqual(len(self.calls), before + 1)
+                    self.assertEqual(origin.expires_at, initial)
         self.status = 307
         with self.assertRaises(Rejected):
             await self.origin.ensure()
@@ -238,12 +401,32 @@ class OriginTransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_json_nonfinite_and_response_limit(self):
         for raw in (b'{"schema_version":1,"schema_version":1}', b'{"x":NaN}', b" " * 4097):
-            self.raw = raw
-            origin = self.manager()
-            before = len(self.calls)
-            with self.assertRaises(Rejected):
-                await origin.ensure()
-            self.assertEqual(len(self.calls), before + 1)
+            for confirmed in (False, True):
+                with self.subTest(raw=raw[:30], confirmed=confirmed):
+                    self.raw = None
+                    origin = self.manager()
+                    if confirmed:
+                        await origin.ensure()
+                        origin.renew_at = 0
+                    self.raw = raw
+                    before = len(self.calls)
+                    with self.assertRaises(Rejected):
+                        await origin.ensure()
+                    self.raw = None
+                    with self.assertRaises(Rejected):
+                        await origin.ensure()
+                    self.assertEqual(len(self.calls), before + 1)
+
+    async def test_invalid_encoding_is_terminal_for_confirmed_origin(self):
+        await self.origin.ensure()
+        self.origin.renew_at = 0
+        self.headers = {"Content-Encoding": "gzip"}
+        with self.assertRaises(Rejected):
+            await self.origin.ensure()
+        self.headers = {}
+        with self.assertRaises(Rejected):
+            await self.origin.ensure()
+        self.assertEqual(len(self.calls), 2)
 
     async def test_continuous_trickle_has_one_total_deadline(self):
         self.stream = True

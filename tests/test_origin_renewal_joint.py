@@ -256,6 +256,44 @@ class RealProductRenewalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.gateway.origin_renewal.ref, self.ref)
         self.assertEqual(len(self.services.calls), 1)
 
+    async def test_failed_renewal_round_recovers_before_ttl_without_config_fallback_or_model_replay(
+        self,
+    ):
+        origin = self.gateway.origin_renewal
+        initial = origin.expires_at
+        request_id = await self.chat()
+        await self.native()
+        before = len(self.renewals)
+        self.offline = True
+        origin.renew_at = 0
+        with self.assertRaises(Rejected) as failure:
+            await origin.ensure()
+        self.assertEqual(failure.exception.status, 503)
+        self.assertIsNone(origin.failure)
+        self.assertEqual(origin.expires_at, initial)
+        self.assertGreaterEqual(len(self.renewals), before + 3)
+        self.assertEqual(self.gateway.configuration_check(), "failed")
+        await self.chat(503)
+        await self.native(503)
+        self.assertEqual((len(self.services.calls), len(self.services.native_calls)), (1, 1))
+
+        self.offline = False
+        async with asyncio.timeout(2):
+            while origin.unavailable:
+                await asyncio.sleep(0.005)
+        origin.check()
+        self.assertEqual(self.gateway.configuration_check(), "ok")
+        self.assertGreater(origin.expires_at, initial)
+        await self.chat()
+        await self.native()
+        await self.chat(409, request_id=request_id)
+        self.assertEqual((len(self.services.calls), len(self.services.native_calls)), (2, 2))
+        self.assertEqual(origin.ref, self.ref)
+        self.assertEqual(os.environ["TS110_INITIAL_ORIGIN"], self.ref)
+        with self.p.store.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM origins").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT ref FROM origins").fetchone()[0], self.ref)
+
     async def test_offline_cross_expiry_no_cache_then_expired_restart_refused_and_rebootstrap_recovers(
         self,
     ):
