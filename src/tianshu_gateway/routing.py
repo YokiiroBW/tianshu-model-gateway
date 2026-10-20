@@ -219,6 +219,7 @@ class StreamObserver:
         self.event_type = b""
         self.event_size = 0
         self.done = self.invalid = self.error = False
+        self.error_types = set()
         self.finished = set()
         self.native_usage = None
         self.event_count = 0
@@ -282,14 +283,27 @@ class StreamObserver:
             self.invalid = True
             return
         if data == b"[DONE]":
+            if self.event_type == b"error":
+                self.error_types.add("other")
             self.done = True
             return
         try:
             value = loads(data)
             if not isinstance(value, dict):
                 raise Rejected()
-            if "error" in value:
+            if "error" in value or self.event_type == b"error":
                 self.error = True
+                error = value.get("error")
+                self.error_types.add(
+                    "rate_limit_error"
+                    if isinstance(error, dict)
+                    and error.get("type") == "rate_limit_error"
+                    and not any(
+                        key in value
+                        for key in ("choices", "content", "tool_calls", "finish_reason")
+                    )
+                    else "other"
+                )
             # A repeated usage-bearing chunk replaces the previous observation; usage is
             # never summed or merged across fragments, so a duplicate terminal cannot
             # count the same tokens twice.
@@ -320,6 +334,21 @@ class StreamObserver:
             and not self.invalid
             and not self.error
             and self.finished == set(range(self.expected_choices))
+            and not self.buffer.strip()
+            and not self.data
+        )
+
+    @property
+    def rate_limit_failure(self):
+        """A complete typed failure at clean EOF, not a successful model result.
+
+        Called only after the upstream iterator and end() finish normally. The
+        bounded type set deliberately retains an unclassified error beside a typed
+        one; one recognized frame cannot override another ambiguous error.
+        """
+        return (
+            self.error_types == {"rate_limit_error"}
+            and not self.invalid
             and not self.buffer.strip()
             and not self.data
         )

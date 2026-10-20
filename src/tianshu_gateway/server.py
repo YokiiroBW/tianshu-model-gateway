@@ -1525,7 +1525,8 @@ class Gateway:
                                 self.checkpoint(execution, receipt, secrets)
                         observer.end()
                         inspected = True
-                        if not observer.complete:
+                        rate_limited = observer.rate_limit_failure
+                        if not observer.complete and not rate_limited:
                             reason = "incomplete_stream"
                             raise Rejected("result_unknown", 502, "unknown")
                         tail = guard.feed(b"", final=True)
@@ -1534,7 +1535,13 @@ class Gateway:
                             if execution:
                                 execution.observe(forwarded=len(tail), observer=observer)
                         await response.write_eof()
-                        record_usage(receipt, observer.native_usage, True)
+                        record_usage(receipt, observer.native_usage, not rate_limited)
+                        if rate_limited:
+                            # Preserve the provider's bytes and HTTP status, including
+                            # a failure with no choices or [DONE]. The owned receipt
+                            # records an actual failed attempt, never not_started.
+                            receipt["outcome"], reason = "failed", "response_failed"
+                            return response
                     else:
                         if content_type != "application/json":
                             raise Rejected("result_unknown", 502, "unknown")
