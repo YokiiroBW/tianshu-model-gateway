@@ -72,14 +72,15 @@ def table_names(connection):
 
 
 def row_digest(cursor):
-    digest = hashlib.sha256()
-    count = 0
+    """Compare complete row multisets without depending on database collation."""
+    rows = []
     for row in cursor:
         encoded = json.dumps(tuple(row), ensure_ascii=True, separators=(",", ":")).encode()
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
-        count += 1
-    return count, digest.digest()
+        rows.append(hashlib.sha256(encoded).digest())
+    digest = hashlib.sha256()
+    for row_hash in sorted(rows):
+        digest.update(row_hash)
+    return len(rows), digest.digest()
 
 
 def prepare_ledger(connection, source):
