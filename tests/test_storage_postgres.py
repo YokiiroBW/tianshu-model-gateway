@@ -149,6 +149,21 @@ class LedgerTests(unittest.TestCase):
                 Diagnostics(self.path, wrong)
         self.assertFalse(self.path.exists())
 
+    def test_active_missing_request_table_fails_without_recreating_empty_idempotency_history(self):
+        ledger = self.ledger()
+        ledger.connection.native("DROP TABLE requests")
+        ledger.close()
+        with self.assertRaisesRegex(sqlite3.Error, "ledger_incomplete"):
+            Diagnostics(self.path, self.options)
+        with closing(open_ledger(self.path, self.options)) as reader:
+            names = {
+                row[0]
+                for row in reader.native(
+                    "SELECT tablename FROM pg_tables WHERE schemaname=current_schema()"
+                )
+            }
+            self.assertNotIn("requests", names)
+
 
 class RealHttpMixin:
     async def asyncSetUp(self):

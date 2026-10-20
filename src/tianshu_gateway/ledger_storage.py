@@ -83,6 +83,14 @@ def row_digest(cursor):
 
 
 def prepare_ledger(connection, source):
+    initialized = (
+        connection.native(
+            "SELECT state FROM __tianshu_storage_binding WHERE singleton=1"
+        ).fetchone()[0]
+        == "ready"
+    )
+    if initialized and not TABLE_KEYS.keys() <= table_names(connection):
+        raise StorageError("gateway_postgresql_ledger_incomplete")
     # SQLite INTEGER facts are signed 64-bit. PG INTEGER would truncate timestamps,
     # normalized usage and configuration versions, so use BIGINT explicitly.
     for schema in (CORE_SCHEMA, PRIVATE_SCHEMA, ADMISSION_SCHEMA):
