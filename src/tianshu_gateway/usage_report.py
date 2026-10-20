@@ -13,9 +13,12 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from tianshu_storage import StorageOptions, StorageRuntime
+
 from .config import EnvSecrets
 from .contracts import Rejected
 from .diagnostics import NATIVE_IDENTITY_FIELDS, PRIVATE_TABLES
+from .ledger_storage import table_names
 from .native import authorize
 from .server import load_settings
 from .usage import build_report, parse_selection
@@ -97,17 +100,20 @@ def select_scope(settings, arguments):
     return "native", dict(zip(NATIVE_IDENTITY_FIELDS, grant.identity(), strict=True))
 
 
-def open_ledger(path):
+def open_ledger(path, options=None):
     """Read-only handle; the migration itself belongs to the running service."""
     try:
-        connection = sqlite3.connect(str(Path(path).resolve().as_uri()) + "?mode=ro", uri=True)
+        connection = StorageRuntime.open_existing(
+            options or StorageOptions.from_settings({}),
+            service="gateway",
+            state_directory=Path(path).resolve().parent,
+            name="diagnostics",
+            path=path,
+        )
     except sqlite3.Error:
         raise LedgerUnavailable("the private ledger could not be opened read-only") from None
     try:
-        names = {
-            row[0]
-            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
+        names = table_names(connection)
     except sqlite3.Error:
         connection.close()
         raise LedgerUnavailable("the private ledger could not be read") from None
@@ -150,7 +156,10 @@ def main(argv):
         return EXIT_USAGE
     connection = None
     try:
-        connection = open_ledger(arguments.database or settings.diagnostics_path)
+        connection = open_ledger(
+            arguments.database or settings.diagnostics_path,
+            StorageOptions.from_settings({"storage_backends": settings.storage_backends}),
+        )
         report = build_report(connection, key_space, identity, values)
     except LedgerUnavailable as exc:
         print(f"usage-report: {exc}", file=sys.stderr)

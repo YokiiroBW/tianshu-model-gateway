@@ -64,7 +64,7 @@ def source_usage(row):
     counts values larger than the projection bound, which contribute the bound to ``sum``.
     Nothing that was not reported is ever counted as zero.
     """
-    attempts, fed, fed_sum, fed_clamped, oed, oed_sum, oed_clamped, complete, absent = row
+    attempts, fed, fed_sum, fed_clamped, oed, oed_sum, oed_clamped, complete, absent = map(int, row)
     return {
         "attempts": attempts,
         "complete": complete,
@@ -226,7 +226,7 @@ class Selection:
         for _, column in LATENCY_COLUMNS:
             fields.extend(
                 (
-                    f"SUM({column} IS NOT NULL)",
+                    f"SUM(CASE WHEN {column} IS NOT NULL THEN 1 ELSE 0 END)",
                     f"MIN({column})",
                     f"MAX({column})",
                     f"AVG({column})",
@@ -244,7 +244,7 @@ class Selection:
                 "missing": row[0] - observed,
                 "min": low,
                 "max": high,
-                "avg": None if average is None else round(average, 3),
+                "avg": None if average is None else round(float(average), 3),
                 "p50": self.percentile(connection, column, 0.50, observed),
                 "p95": self.percentile(connection, column, 0.95, observed),
             }
@@ -276,7 +276,9 @@ class Selection:
             ),
             ("cancelled", "reason IN ('cancelled_unknown','cancelled_before_start')"),
         )
-        select = ", ".join(f"SUM({sql}) AS {name}" for name, sql in fields)
+        select = ", ".join(
+            f"SUM(CASE WHEN {sql} THEN 1 ELSE 0 END) AS {name}" for name, sql in fields
+        )
         row = self.scalar(
             connection, f"SELECT COUNT(*), {select} FROM {self.window}", self.parameters
         )
@@ -304,12 +306,12 @@ class Selection:
         bound = MAX_METRIC_TOKENS
         select = (
             "COUNT(*), "
-            f"COUNT(input_tokens), COALESCE(SUM(MIN(input_tokens, {bound})),0), "
-            f"COALESCE(SUM(input_tokens > {bound}),0), "
-            f"COUNT(output_tokens), COALESCE(SUM(MIN(output_tokens, {bound})),0), "
-            f"COALESCE(SUM(output_tokens > {bound}),0), "
+            f"COUNT(input_tokens), COALESCE(SUM(CASE WHEN input_tokens>{bound} THEN {bound} ELSE input_tokens END),0), "
+            f"COALESCE(SUM(CASE WHEN input_tokens > {bound} THEN 1 ELSE 0 END),0), "
+            f"COUNT(output_tokens), COALESCE(SUM(CASE WHEN output_tokens>{bound} THEN {bound} ELSE output_tokens END),0), "
+            f"COALESCE(SUM(CASE WHEN output_tokens > {bound} THEN 1 ELSE 0 END),0), "
             "COALESCE(SUM(usage_complete),0), "
-            "COALESCE(SUM(input_tokens IS NULL AND output_tokens IS NULL),0)"
+            "COALESCE(SUM(CASE WHEN input_tokens IS NULL AND output_tokens IS NULL THEN 1 ELSE 0 END),0)"
         )
         sources = {}
         for source, *row in connection.execute(

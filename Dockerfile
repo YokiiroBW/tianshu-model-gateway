@@ -31,6 +31,7 @@ WORKDIR /build
 # Only what the resolution needs. The project is installed from source with --no-editable, so
 # the runtime stage carries an installed package rather than a source tree to import from.
 COPY pyproject.toml uv.lock ./
+COPY vendor/ ./vendor/
 COPY src/ ./src/
 # Dependencies use the unchanged uv.lock. Build the project separately with the pinned backend.
 RUN python -m uv sync --locked --no-dev --no-editable --no-install-project --no-build --python /usr/local/bin/python3.12 \

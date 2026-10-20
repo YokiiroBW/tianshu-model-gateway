@@ -34,6 +34,7 @@ from .contracts import (
     loads,
 )
 from .diagnostics import NATIVE_IDENTITY_FIELDS, Diagnostics, attempt_metrics, redact
+from tianshu_storage import StorageOptions
 from .execution import Executions, capability_projection, check_capabilities
 from .native import (
     NativeConfigCache,
@@ -204,6 +205,7 @@ class Settings:
     memory_retrieval_credential_ref: str | None = None
     provider_self_service: bool = False
     provider_nat64_prefixes: tuple[str, ...] = ()
+    storage_backends: dict = field(default_factory=dict, repr=False)
 
     @property
     def policy(self):
@@ -215,6 +217,7 @@ class Settings:
         return self.workload_bindings or Classification()
 
     def validate(self):
+        StorageOptions.from_settings({"storage_backends": self.storage_backends})
         if type(self.provider_self_service) is not bool:
             raise ValueError("provider self service flag required")
         if not isinstance(self.provider_nat64_prefixes, (list, tuple)) or not all(
@@ -1876,7 +1879,10 @@ def create_app(settings, observability=None):
     app = web.Application(middlewares=[errors], client_max_size=settings.max_request_bytes)
 
     async def resources(app):
-        diagnostics = Diagnostics(settings.diagnostics_path)
+        diagnostics = Diagnostics(
+            settings.diagnostics_path,
+            StorageOptions.from_settings({"storage_backends": settings.storage_backends}),
+        )
         try:
             for version in settings.revoked_versions:
                 diagnostics.revoke(version)

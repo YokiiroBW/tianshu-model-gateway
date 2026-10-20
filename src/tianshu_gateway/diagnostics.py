@@ -1,4 +1,4 @@
-"""Small local SQLite ledger. No native bodies, credential values or exception text.
+"""Owned SQLite/PostgreSQL ledger. No message bodies, credentials or exception text.
 
 The Chat tables and the native tables are separate key spaces. A native version is never
 written into the Chat ``configs``/``revoked`` chain, and native receipts are keyed by
@@ -27,8 +27,13 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass
+from pathlib import Path
+
+from tianshu_storage import StorageOptions, StorageRuntime
 
 from .contracts import Rejected
+from .ledger_schema import ADMISSION_SCHEMA, CORE_SCHEMA, PRIVATE_SCHEMA
+from .ledger_storage import prepare_ledger, postgres_connection, table_names
 
 LOG = logging.getLogger("tianshu_gateway")
 
@@ -203,106 +208,58 @@ def _project_metrics(receipt, observer, elapsed_ms, stream, inspected):
     )
 
 
-PRIVATE_SCHEMA = """
-    CREATE TABLE IF NOT EXISTS request_metrics (
-        service TEXT NOT NULL, request_id TEXT NOT NULL, completed_at_ms INTEGER NOT NULL,
-        first_upstream_byte_ms INTEGER, first_event_ms INTEGER, first_output_ms INTEGER,
-        usage_source TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER,
-        usage_complete INTEGER NOT NULL,
-        PRIMARY KEY(service, request_id));
-    CREATE INDEX IF NOT EXISTS request_metrics_window
-        ON request_metrics(service, completed_at_ms, request_id);
-    CREATE TABLE IF NOT EXISTS native_request_metrics (
-        contract TEXT NOT NULL, principal_id TEXT NOT NULL, caller_service TEXT NOT NULL,
-        credential_namespace TEXT NOT NULL, request_id TEXT NOT NULL,
-        completed_at_ms INTEGER NOT NULL,
-        first_upstream_byte_ms INTEGER, first_event_ms INTEGER, first_output_ms INTEGER,
-        usage_source TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER,
-        usage_complete INTEGER NOT NULL,
-        PRIMARY KEY(contract, principal_id, caller_service, credential_namespace, request_id));
-    CREATE INDEX IF NOT EXISTS native_request_metrics_window
-        ON native_request_metrics(contract, principal_id, caller_service, credential_namespace,
-                                  completed_at_ms, request_id);
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-"""
-
 PRIVATE_TABLES = ("request_metrics", "native_request_metrics")
-
-# The admission projection answers one question the receipt chain cannot: how long a request
-# waited inside the gateway's own bounded pool before capacity was granted, and what class
-# the deployment had bound it to. It stores no upstream fact, no request content and no
-# credential, and it is written by the scheduler, never by the forward path.
-ADMISSION_SCHEMA = """
-    CREATE TABLE IF NOT EXISTS admission_metrics (
-        service TEXT NOT NULL, request_id TEXT NOT NULL, workload_class TEXT NOT NULL,
-        outcome TEXT NOT NULL, wait_ms INTEGER,
-        PRIMARY KEY(service, request_id));
-"""
-
-
-def table_names(connection):
-    return {
-        row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    }
 
 
 class Diagnostics:
-    def __init__(self, path):
+    def __init__(self, path, storage_options=None):
         self.path = str(path)
-        self.connection = sqlite3.connect(path)
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA busy_timeout=1000")
-        # The observation port is injected by the caller and defaults to silence, so this
-        # module keeps owning only its tables and its transaction rules.
+        self.storage = StorageRuntime(
+            storage_options or StorageOptions.from_settings({}),
+            service="gateway",
+            state_directory=Path(path).resolve().parent,
+        )
         self._observer = _no_observation
-        # Read the table set before creating anything, so a fresh database is not
-        # mistaken for an existing deployment that needs an upgrade copy.
-        deployed = table_names(self.connection)
-        self.connection.executescript("""
-            CREATE TABLE IF NOT EXISTS requests (
-                service TEXT NOT NULL, request_id TEXT NOT NULL, receipt TEXT NOT NULL,
-                reason TEXT NOT NULL, elapsed_ms INTEGER, upstream_status INTEGER,
-                PRIMARY KEY(service, request_id));
-            CREATE TABLE IF NOT EXISTS turns (
-                service TEXT NOT NULL, turn_id TEXT NOT NULL, version INTEGER NOT NULL,
-                PRIMARY KEY(service, turn_id));
-            CREATE TABLE IF NOT EXISTS revoked (version INTEGER PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS configs (version INTEGER PRIMARY KEY, digest TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS native_configs (
-                contract TEXT NOT NULL, principal_id TEXT NOT NULL, caller_service TEXT NOT NULL,
-                credential_namespace TEXT NOT NULL, native_config_version INTEGER NOT NULL,
-                digest TEXT NOT NULL,
-                PRIMARY KEY(contract, principal_id, caller_service, credential_namespace,
-                            native_config_version));
-            CREATE TABLE IF NOT EXISTS native_revoked (
-                contract TEXT NOT NULL, principal_id TEXT NOT NULL, caller_service TEXT NOT NULL,
-                credential_namespace TEXT NOT NULL, native_config_version INTEGER NOT NULL,
-                PRIMARY KEY(contract, principal_id, caller_service, credential_namespace,
-                            native_config_version));
-            CREATE TABLE IF NOT EXISTS native_requests (
-                contract TEXT NOT NULL, principal_id TEXT NOT NULL, caller_service TEXT NOT NULL,
-                credential_namespace TEXT NOT NULL, request_id TEXT NOT NULL, receipt TEXT NOT NULL,
-                reason TEXT NOT NULL, elapsed_ms INTEGER, upstream_status INTEGER,
-                PRIMARY KEY(contract, principal_id, caller_service, credential_namespace,
-                            request_id));
-            CREATE TABLE IF NOT EXISTS native_turns (
-                contract TEXT NOT NULL, principal_id TEXT NOT NULL, caller_service TEXT NOT NULL,
-                credential_namespace TEXT NOT NULL, turn_id TEXT NOT NULL,
-                native_config_version INTEGER NOT NULL,
-                PRIMARY KEY(contract, principal_id, caller_service, credential_namespace, turn_id));
-        """)
-        self.migration_backup = self.migrate(deployed)
-        self.recover_executions()
+        self.connection = None
+        try:
+            self.storage.start()
+            self.database = self.storage.database("diagnostics", path, prepare=prepare_ledger)
+            self.connection = self.database.connect()
+            if self.database.backend == "postgresql":
+                # Recovery belongs to one process. The session lock dies with this
+                # exact connection; do not reconnect it or replay interrupted writes.
+                locked = self.connection.native(
+                    "SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':runtime-owner',0))"
+                ).fetchone()[0]
+                if not locked:
+                    raise sqlite3.OperationalError("gateway_storage_owner_unavailable")
+                self.migration_backup = None
+            else:
+                self.connection.execute("PRAGMA journal_mode=WAL")
+                self.connection.execute("PRAGMA busy_timeout=1000")
+                deployed = table_names(self.connection)
+                self.connection.executescript(CORE_SCHEMA)
+                self.migration_backup = self.migrate(deployed)
+            self.recover_executions()
+            self.storage.finalize()
+        except BaseException:
+            self.close()
+            raise
 
     def recover_executions(self):
         """A previous process cannot still own an active task; never replay its call."""
         with self.connection:
             for table in ("requests", "native_requests"):
+                columns = (
+                    ("service", "request_id")
+                    if table == "requests"
+                    else (*NATIVE_IDENTITY_FIELDS, "request_id")
+                )
                 rows = self.connection.execute(
-                    f"SELECT rowid, receipt FROM {table} WHERE reason='in_flight'"
+                    f"SELECT {','.join(columns)}, receipt FROM {table} WHERE reason='in_flight'"
                 ).fetchall()
-                for row_id, raw in rows:
+                for row in rows:
+                    *identity, raw = row
                     receipt = json.loads(raw)
                     execution = receipt.get("execution")
                     if isinstance(execution, dict):
@@ -310,8 +267,9 @@ class Diagnostics:
                     receipt["outcome"] = "unknown"
                     receipt["usage_complete"] = False
                     self.connection.execute(
-                        f"UPDATE {table} SET receipt=?,reason='interrupted_unknown' WHERE rowid=?",
-                        (json.dumps(receipt), row_id),
+                        f"UPDATE {table} SET receipt=?,reason='interrupted_unknown' WHERE "
+                        + " AND ".join(f"{column}=?" for column in columns),
+                        (json.dumps(receipt), *identity),
                     )
 
     def progress(self, receipt):
@@ -373,7 +331,7 @@ class Diagnostics:
             self.connection.executescript(script)
             with self.connection:
                 self.connection.execute(
-                    "INSERT OR REPLACE INTO schema_migrations VALUES (?,?)",
+                    "INSERT INTO schema_migrations VALUES (?,?) ON CONFLICT(version) DO UPDATE SET applied_at=excluded.applied_at",
                     (version, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
                 )
         return backup
@@ -400,8 +358,10 @@ class Diagnostics:
             raise ValueError("invalid admission wait")
         self.project_metric(
             "admission_metrics",
-            "INSERT OR REPLACE INTO admission_metrics "
-            "(service, request_id, workload_class, outcome, wait_ms) VALUES (?,?,?,?,?)",
+            "INSERT INTO admission_metrics "
+            "(service, request_id, workload_class, outcome, wait_ms) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(service,request_id) DO UPDATE SET workload_class=excluded.workload_class,"
+            "outcome=excluded.outcome,wait_ms=excluded.wait_ms",
             (service, request_id, workload_class, outcome, wait_ms),
         )
 
@@ -423,11 +383,15 @@ class Diagnostics:
         if row and row[0] != digest:
             raise Rejected("version_conflict", 409)
         with self.connection:
-            self.connection.execute("INSERT OR IGNORE INTO configs VALUES (?,?)", (version, digest))
+            self.connection.execute(
+                "INSERT INTO configs VALUES (?,?) ON CONFLICT DO NOTHING", (version, digest)
+            )
 
     def revoke(self, version):
         with self.connection:
-            self.connection.execute("INSERT OR IGNORE INTO revoked VALUES (?)", (version,))
+            self.connection.execute(
+                "INSERT INTO revoked VALUES (?) ON CONFLICT DO NOTHING", (version,)
+            )
 
     def is_revoked(self, version):
         return bool(
@@ -446,7 +410,7 @@ class Diagnostics:
                     if row and row[0] != receipt["config_version"]:
                         raise Rejected("version_conflict", 409)
                     self.connection.execute(
-                        "INSERT OR IGNORE INTO turns VALUES (?,?,?)",
+                        "INSERT INTO turns VALUES (?,?,?) ON CONFLICT DO NOTHING",
                         (service, turn_id, receipt["config_version"]),
                     )
                 self.connection.execute(
@@ -488,10 +452,11 @@ class Diagnostics:
             raise
         self.project_metric(
             "request_metrics",
-            "INSERT OR REPLACE INTO request_metrics "
+            "INSERT INTO request_metrics "
             "(service, request_id, completed_at_ms, first_upstream_byte_ms, first_event_ms, "
             "first_output_ms, usage_source, input_tokens, output_tokens, usage_complete) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(service,request_id) DO UPDATE SET "
+            "completed_at_ms=excluded.completed_at_ms,first_upstream_byte_ms=excluded.first_upstream_byte_ms,first_event_ms=excluded.first_event_ms,first_output_ms=excluded.first_output_ms,usage_source=excluded.usage_source,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,usage_complete=excluded.usage_complete",
             (
                 receipt["caller_service"],
                 receipt["request_id"],
@@ -541,14 +506,15 @@ class Diagnostics:
             raise Rejected("version_conflict", 409)
         with self.connection:
             self.connection.execute(
-                "INSERT OR IGNORE INTO native_configs VALUES (?,?,?,?,?,?)",
+                "INSERT INTO native_configs VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING",
                 (*identity, version, digest),
             )
 
     def native_revoke(self, identity, version):
         with self.connection:
             self.connection.execute(
-                "INSERT OR IGNORE INTO native_revoked VALUES (?,?,?,?,?)", (*identity, version)
+                "INSERT INTO native_revoked VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING",
+                (*identity, version),
             )
 
     def native_is_revoked(self, identity, version):
@@ -571,7 +537,7 @@ class Diagnostics:
                     if row and row[0] != version:
                         raise Rejected("version_conflict", 409)
                     self.connection.execute(
-                        "INSERT OR IGNORE INTO native_turns VALUES (?,?,?,?,?,?)",
+                        "INSERT INTO native_turns VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING",
                         (*identity, turn_id, version),
                     )
                 self.connection.execute(
@@ -607,11 +573,13 @@ class Diagnostics:
             raise
         self.project_metric(
             "native_request_metrics",
-            "INSERT OR REPLACE INTO native_request_metrics "
+            "INSERT INTO native_request_metrics "
             "(contract, principal_id, caller_service, credential_namespace, request_id, "
             "completed_at_ms, first_upstream_byte_ms, first_event_ms, first_output_ms, "
             "usage_source, input_tokens, output_tokens, usage_complete) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(contract,principal_id,caller_service,credential_namespace,request_id) DO UPDATE SET "
+            "completed_at_ms=excluded.completed_at_ms,first_upstream_byte_ms=excluded.first_upstream_byte_ms,first_event_ms=excluded.first_event_ms,first_output_ms=excluded.first_output_ms,usage_source=excluded.usage_source,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,usage_complete=excluded.usage_complete",
             (
                 *identity,
                 receipt["request_id"],
@@ -664,4 +632,17 @@ class Diagnostics:
             return False
 
     def close(self):
-        self.connection.close()
+        try:
+            if self.connection is not None:
+                if postgres_connection(self.connection):
+                    try:
+                        self.connection.rollback()
+                        self.connection.native(
+                            "SELECT pg_advisory_unlock(hashtextextended(current_schema() || ':runtime-owner',0))"
+                        )
+                    except sqlite3.Error:
+                        self.connection.raw.close()
+                self.connection.close()
+                self.connection = None
+        finally:
+            self.storage.close()

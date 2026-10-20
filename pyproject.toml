@@ -7,7 +7,10 @@ name = "tianshu-model-gateway"
 version = "0.1.0"
 description = "Version-pinned native Chat Completions data gateway"
 requires-python = ">=3.12"
-dependencies = ["aiohttp==3.14.1", "jsonschema==4.26.0", "referencing==0.37.0"]
+dependencies = ["aiohttp==3.14.1", "jsonschema==4.26.0", "referencing==0.37.0", "tianshu-storage==0.1.0"]
+
+[tool.uv.sources]
+tianshu-storage = {path = "vendor/tianshu_storage-0.1.0-py3-none-any.whl"}
 
 [project.optional-dependencies]
 dev = ["ruff==0.15.7"]
