@@ -157,6 +157,7 @@ class RecordingServices:
         self.source_wrong_request = False
         self.mode = "json"
         self.http_status = 429
+        self.response_headers = {}
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.disconnected = asyncio.Event()
@@ -175,6 +176,7 @@ class RecordingServices:
         self.native_revoked_versions = set()
         self.native_mode = "json"
         self.native_http_status = 429
+        self.native_response_headers = {}
         self.native_started = asyncio.Event()
         self.native_release = asyncio.Event()
         self.native_disconnected = asyncio.Event()
@@ -353,6 +355,7 @@ class RecordingServices:
                         "X-Request-ID": SECRETS["TS041_TEST_UPSTREAM"],
                         "Location": request.scheme + "://127.0.0.1:1/stolen",
                         "Set-Cookie": "secret=" + SECRETS["TS041_TEST_UPSTREAM"],
+                        **self.response_headers,
                     },
                 )
             if self.mode in {"stream", "drop", "sse_hold", "secret_stream", "one_byte"}:
@@ -360,6 +363,7 @@ class RecordingServices:
                     headers={
                         "Content-Type": "text/event-stream",
                         "X-Request-ID": "upstream-fixture",
+                        **self.response_headers,
                     }
                 )
                 await response.prepare(request)
@@ -393,7 +397,10 @@ class RecordingServices:
                     body=b"compressed",
                     headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
                 )
-            return web.json_response(self.response, headers={"X-Request-ID": "upstream-fixture"})
+            return web.json_response(
+                self.response,
+                headers={"X-Request-ID": "upstream-fixture", **self.response_headers},
+            )
         except (asyncio.CancelledError, ConnectionResetError):
             self.disconnected.set()
             raise
@@ -416,6 +423,7 @@ class RecordingServices:
                         "X-Request-ID": SECRETS["TS042_TEST_NATIVE_UPSTREAM"],
                         "Location": request.scheme + "://127.0.0.1:1/stolen",
                         "Set-Cookie": "secret=" + SECRETS["TS042_TEST_NATIVE_UPSTREAM"],
+                        **self.native_response_headers,
                     },
                 )
             if self.native_mode == "error_json":
@@ -425,6 +433,7 @@ class RecordingServices:
                     headers={
                         "Location": request.scheme + "://127.0.0.1:1/stolen",
                         "Set-Cookie": "secret=" + SECRETS["TS042_TEST_NATIVE_UPSTREAM"],
+                        **self.native_response_headers,
                     },
                 )
             if held or self.native_mode in {
@@ -438,6 +447,7 @@ class RecordingServices:
                     headers={
                         "Content-Type": "text/event-stream",
                         "X-Request-ID": "native-upstream-fixture",
+                        **self.native_response_headers,
                     }
                 )
                 await response.prepare(request)
@@ -483,7 +493,7 @@ class RecordingServices:
             return web.Response(
                 body=self.native_response_bytes,
                 content_type="application/json",
-                headers={"X-Request-ID": "native-upstream-fixture"},
+                headers={"X-Request-ID": "native-upstream-fixture", **self.native_response_headers},
             )
         except (asyncio.CancelledError, ConnectionResetError):
             self.native_disconnected.set()

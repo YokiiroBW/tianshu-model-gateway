@@ -13,7 +13,7 @@ import aiohttp
 from .config import read_limited, utcnow
 from .contracts import NATIVE_CONTRACT, Rejected, loads
 from .diagnostics import attempt_metrics, native_identity, redact
-from .routing import SecretGuard, StreamObserver
+from .routing import SecretGuard, StreamObserver, retry_after_headers
 
 PROTOCOL = "openai-responses"
 TERMINALS = {"completed": "succeeded", "failed": "failed", "incomplete": "unknown"}
@@ -206,6 +206,7 @@ async def send_responses(
     on_first_output=None,
     execution=None,
     integration_headers=None,
+    on_response_headers=None,
 ):
     """One HTTP attempt with asynchronous sink/backpressure and native-ledger observation.
 
@@ -215,6 +216,9 @@ async def send_responses(
     row. ``ledger`` is the independent native key space: it exposes
     ``native_is_revoked(identity, version)`` and
     ``native_finish(receipt, reason, elapsed_ms, upstream_status)``.
+
+    Optional synchronous ``on_response_headers(headers)`` receives only validated error
+    wait hints before start_response; existing two-argument response sinks stay unchanged.
 
     The caller must abort its downstream on exceptions; this function never adds SSE
     markers, retries, redirects, publishes config, or claims a local receipt is a wire
@@ -312,10 +316,15 @@ async def send_responses(
                     if execution:
                         execution.observe(received=len(raw))
                     guard.feed(raw, final=True)
-                    # Native JSON errors are preserved; no upstream cookies/location/credentials.
+                    # Native JSON errors are preserved; only a safe wait hint may accompany them.
                     if upstream.content_type != "application/json":
                         raise Rejected("result_unknown", 502, "unknown")
                     loads(raw)
+                    headers = retry_after_headers(
+                        upstream.status, upstream.headers.getall("Retry-After", ()), secrets
+                    )
+                    if headers and on_response_headers is not None:
+                        on_response_headers(headers)
                     await start_response(upstream.status, "application/json")
                     await write(raw)
                     receipt["outcome"] = "failed" if 400 <= upstream.status < 500 else "unknown"

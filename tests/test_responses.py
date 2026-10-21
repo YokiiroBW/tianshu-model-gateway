@@ -179,6 +179,7 @@ class ResponsesHttpTests(unittest.IsolatedAsyncioTestCase):
         self.release = asyncio.Event()
         self.disconnected = asyncio.Event()
         self.status = 429
+        self.response_headers = {}
         app = web.Application()
         app.router.add_post("/v1/responses", self.upstream)
         runner, self.base = await start_http(app)
@@ -206,7 +207,11 @@ class ResponsesHttpTests(unittest.IsolatedAsyncioTestCase):
                     status=self.status,
                     body=self.raw_response,
                     content_type="application/json",
-                    headers={"Location": self.base + "/v1/responses", "Set-Cookie": "x=y"},
+                    headers={
+                        "Location": self.base + "/v1/responses",
+                        "Set-Cookie": "x=y",
+                        **self.response_headers,
+                    },
                 )
             if self.mode in {"stream", "one_byte", "drop", "sse_hold"}:
                 response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
@@ -319,6 +324,32 @@ class ResponsesHttpTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(self.saved()["usage"])
             self.assertFalse(self.saved()["usage_complete"])
         self.assertEqual(len(self.calls), 4)
+
+    async def test_error_wait_hint_sink_is_optional_and_keeps_two_argument_start_callback(self):
+        self.mode = "error"
+        self.raw_response = b'{"error":{"code":"rate_limit_exceeded"}}'
+        self.response_headers = {"Retry-After": "120"}
+        await self.send()
+        self.assertEqual(self.headers, [(429, "application/json")])
+        self.assertEqual(self.chunks, [self.raw_response])
+        hint_headers = []
+        await self.send(on_response_headers=hint_headers.append)
+        self.assertEqual(hint_headers, [{"Retry-After": "120"}])
+        self.assertEqual(self.headers[-1], (429, "application/json"))
+        self.assertEqual(self.chunks[-1], self.raw_response)
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_error_wait_hint_sink_drops_invalid_other_status_and_secret_values(self):
+        self.mode = "error"
+        self.raw_response = b'{"error":{"code":"rate_limit_exceeded"}}'
+        hint_headers = []
+        for status, value in ((400, "120"), (429, "NaN"), (503, "1234567890123456")):
+            self.status = status
+            self.response_headers = {"Retry-After": value}
+            await self.send(on_response_headers=hint_headers.append, secrets=("1234567890123456",))
+            self.assertEqual(self.chunks[-1], self.raw_response)
+        self.assertEqual(hint_headers, [])
+        self.assertEqual(len(self.calls), 3)
 
     async def test_http_sse_failed_incomplete_error_and_missing_usage(self):
         self.mode = "stream"

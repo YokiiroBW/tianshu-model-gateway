@@ -71,7 +71,15 @@ from .origin_renewal import (
     validate_settings as validate_origin_renewal,
 )
 from .responses import send_responses, validate_request
-from .routing import PROTOCOL, SecretGuard, StreamObserver, apply_fields, prepare, record_usage
+from .routing import (
+    PROTOCOL,
+    SecretGuard,
+    StreamObserver,
+    apply_fields,
+    prepare,
+    record_usage,
+    retry_after_headers,
+)
 from .scheduler import AdmissionRefused, BoundedAdmissionScheduler, bind
 from .usage import build_report
 
@@ -1342,6 +1350,7 @@ class Gateway:
     ):
         """Stream native bytes downstream; never rewrite, retry or fabricate a terminal."""
         state = {"response": None, "pending": None, "stream": False}
+        response_headers = {}
         started = time.monotonic()
 
         def first_output():
@@ -1353,6 +1362,7 @@ class Gateway:
                 "Content-Type": content_type,
                 "Cache-Control": "no-store",
                 "X-Request-ID": receipt["request_id"],
+                **response_headers,
             }
             if content_type == "text/event-stream":
                 response = web.StreamResponse(
@@ -1383,6 +1393,7 @@ class Gateway:
                 credential=credential,
                 receipt=receipt,
                 start_response=start_response,
+                on_response_headers=response_headers.update,
                 write=write,
                 timeout=min(binding["timeout_ms"], self.settings.max_timeout_ms) / 1000,
                 max_response_bytes=self.settings.max_response_bytes,
@@ -1484,11 +1495,19 @@ class Gateway:
                     if not 200 <= upstream.status < 300:
                         receipt["outcome"] = "failed" if 400 <= upstream.status < 500 else "unknown"
                         reason = "upstream_http_error"
-                        # Preserve status, never echo the raw provider error or headers.
-                        return error_response(
+                        # Preserve status and a safe wait hint, never the raw provider error.
+                        response = error_response(
                             Rejected("dependency_unavailable", upstream.status, "unknown"),
                             receipt["request_id"],
                         )
+                        response.headers.update(
+                            retry_after_headers(
+                                upstream.status,
+                                upstream.headers.getall("Retry-After", ()),
+                                (*secrets, credential),
+                            )
+                        )
+                        return response
                     if upstream.headers.get("Content-Encoding", "identity").lower() != "identity":
                         raise Rejected("result_unknown", 502, "unknown")
                     content_type = upstream.content_type

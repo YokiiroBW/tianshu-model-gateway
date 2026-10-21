@@ -2,7 +2,9 @@
 
 import copy
 import json
+import re
 import time
+from email.utils import parsedate_to_datetime
 
 from .config import utcnow
 from .contracts import Rejected, loads
@@ -17,6 +19,40 @@ STATE_KEYS = {
     "file_id",
     "container_id",
 }
+RETRY_AFTER_DATE = re.compile(
+    r"(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} [A-Z][a-z]{2} [0-9]{4}"
+    r"|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
+    r"[0-9]{2}-[A-Z][a-z]{2}-[0-9]{2}) "
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2} (?:GMT|[+-](?:[01][0-9]|2[0-3])[0-5][0-9])"
+)
+
+
+def retry_after_headers(status, values, secrets=()):
+    """Allow one bounded wait hint, never other upstream headers or reflected secrets."""
+    if status not in {429, 503} or len(values) != 1:
+        return {}
+    raw = values[0]
+    if (
+        not isinstance(raw, str)
+        or not 1 <= len(raw) <= 128
+        or any(not 32 <= ord(char) <= 126 for char in raw)
+    ):
+        return {}
+    value = raw.strip(" ")
+    if not re.fullmatch(r"[0-9]+", value):
+        if not RETRY_AFTER_DATE.fullmatch(value):
+            return {}
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None or date.utcoffset() is None:
+                return {}
+        except (ValueError, TypeError, OverflowError):
+            return {}
+    try:
+        SecretGuard(secrets).feed(raw.encode("ascii"), final=True)
+    except Rejected:
+        return {}
+    return {"Retry-After": value}
 
 
 def has_state_reference(value):
