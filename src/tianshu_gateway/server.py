@@ -896,7 +896,9 @@ class Gateway:
         if any(secret in context["request_id"] for secret in self.secrets.known_values()):
             raise Rejected()
         if context["config_version"] not in (grant.config_version, *grant.allowed_versions) and (
-            self.dynamic_source is None or not grant.internal or grant.service != "companion"
+            self.dynamic_source is None
+            or not grant.internal
+            or grant.service not in {"companion", "companion_background"}
         ):
             raise Rejected("forbidden", 403)
         return context["request_id"], context["config_version"], context["turn_id"]
