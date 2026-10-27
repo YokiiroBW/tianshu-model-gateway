@@ -237,10 +237,22 @@ class NativeConfigSource:
     writes, caches into Chat tables or guesses a protocol from the request body.
     """
 
-    def __init__(self, session, contracts, targets, secrets, base_url, credential_ref, origin_env):
+    def __init__(
+        self,
+        session,
+        contracts,
+        targets,
+        secrets,
+        base_url,
+        credential_ref,
+        origin_env,
+        *,
+        environ=None,
+    ):
         targets.check(base_url)
         self.session, self.contracts, self.secrets = session, contracts, secrets
         self.base_url, self.credential_ref, self.origin_env = base_url, credential_ref, origin_env
+        self.environ = os.environ if environ is None else environ
 
     async def fetch(self, version):
         request_id = str(uuid.uuid4())
@@ -248,7 +260,7 @@ class NativeConfigSource:
             "query": {
                 "schema_version": 1,
                 "request_id": request_id,
-                "origin": {"assertion_ref": os.environ.get(self.origin_env, "")},
+                "origin": {"assertion_ref": self.environ.get(self.origin_env, "")},
             },
             "native_config_version": version,
             "contract": NATIVE_CONTRACT,

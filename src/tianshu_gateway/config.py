@@ -32,18 +32,19 @@ def timestamp(value):
 class EnvSecrets:
     """Deployment-owned allowlist; config documents contain references only."""
 
-    def __init__(self, references):
+    def __init__(self, references, *, environ=None):
         self.references = dict(references)
+        self.environ = os.environ if environ is None else environ
 
     def resolve(self, reference):
         name = self.references.get(reference)
-        value = os.environ.get(name, "") if name else ""
+        value = self.environ.get(name, "") if name else ""
         if len(value) < 16 or len(value) > 4096 or any(ord(c) < 33 or ord(c) > 126 for c in value):
             raise Rejected("dependency_unavailable", 503)
         return value
 
     def known_values(self):
-        return [os.environ[n] for n in self.references.values() if os.environ.get(n)]
+        return [self.environ[n] for n in self.references.values() if self.environ.get(n)]
 
 
 class RegisteredTargets(AbstractResolver):
@@ -238,10 +239,13 @@ class HttpConfigSource:
         credential_ref,
         origin_env,
         on_success=None,
+        *,
+        environ=None,
     ):
         targets.check(base_url)
         self.session, self.contracts, self.secrets = session, contracts, secrets
         self.base_url, self.credential_ref, self.origin_env = base_url, credential_ref, origin_env
+        self.environ = os.environ if environ is None else environ
         # Observation seam: called once per snapshot this process really fetched and verified.
         # It is never called for a cache hit, it cannot change the returned document, and a
         # failure inside it is confined to the observation side channel.
@@ -253,7 +257,7 @@ class HttpConfigSource:
             "query": {
                 "schema_version": 1,
                 "request_id": request_id,
-                "origin": {"assertion_ref": os.environ.get(self.origin_env, "")},
+                "origin": {"assertion_ref": self.environ.get(self.origin_env, "")},
             },
             "config_version": version,
         }

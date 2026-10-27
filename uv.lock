@@ -740,20 +740,20 @@ requires-dist = [
     { name = "jsonschema", specifier = "==4.26.0" },
     { name = "referencing", specifier = "==0.37.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.7" },
-    { name = "tianshu-storage", path = "vendor/tianshu_storage-0.1.0-py3-none-any.whl" },
+    { name = "tianshu-storage", path = "vendor/tianshu_storage-0.1.3-py3-none-any.whl" },
 ]
 provides-extras = ["dev"]
 
 [[package]]
 name = "tianshu-storage"
-version = "0.1.0"
-source = { path = "vendor/tianshu_storage-0.1.0-py3-none-any.whl" }
+version = "0.1.3"
+source = { path = "vendor/tianshu_storage-0.1.3-py3-none-any.whl" }
 dependencies = [
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "redis" },
 ]
 wheels = [
-    { filename = "tianshu_storage-0.1.0-py3-none-any.whl", hash = "sha256:e7c8ef910a43a5e2d1f426948fe19e4ea3942e1ff0618a35ecfae03bfedc1482" },
+    { filename = "tianshu_storage-0.1.3-py3-none-any.whl", hash = "sha256:a87947a1260fd24de5ae241f19fcc3bb2c2d3fa2869c9a0328825b5f81789d0f" },
 ]
 
 [package.metadata]

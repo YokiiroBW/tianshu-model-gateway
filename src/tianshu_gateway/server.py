@@ -1,16 +1,18 @@
 """Actual aiohttp transport with one attempt, cancellation and bounded streaming."""
 
 import asyncio
-import json
 import hmac
+import json
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 
 import aiohttp
 from aiohttp import web
+from tianshu_storage import StorageOptions
 
 from .config import (
     Classification,
@@ -34,7 +36,6 @@ from .contracts import (
     loads,
 )
 from .diagnostics import NATIVE_IDENTITY_FIELDS, Diagnostics, attempt_metrics, redact
-from tianshu_storage import StorageOptions
 from .execution import Executions, capability_projection, check_capabilities
 from .native import (
     NativeConfigCache,
@@ -56,6 +57,13 @@ from .observability import (
 from .observability import events as observation_events
 from .observability import health as probe_health
 from .observability.events import load_contract
+from .origin_renewal import (
+    CurrentCache,
+    OriginRenewal,
+)
+from .origin_renewal import (
+    validate_settings as validate_origin_renewal,
+)
 from .provider_adapter import (
     PROVIDER_SESSION_HEADER,
     ExecutionContext,
@@ -65,11 +73,6 @@ from .provider_adapter import (
     provider_headers,
 )
 from .provider_runtime import ProviderRuntimeSource
-from .origin_renewal import (
-    CurrentCache,
-    OriginRenewal,
-    validate_settings as validate_origin_renewal,
-)
 from .responses import send_responses, validate_request
 from .routing import (
     PROTOCOL,
@@ -224,8 +227,8 @@ class Settings:
     def classification(self):
         return self.workload_bindings or Classification()
 
-    def validate(self):
-        StorageOptions.from_settings({"storage_backends": self.storage_backends})
+    def validate(self, *, environ=None):
+        StorageOptions.from_settings({"storage_backends": self.storage_backends}, environ=environ)
         if type(self.provider_self_service) is not bool:
             raise ValueError("provider self service flag required")
         if not isinstance(self.provider_nat64_prefixes, (list, tuple)) or not all(
@@ -324,10 +327,21 @@ class Settings:
 
 class Gateway:
     def __init__(
-        self, settings, contracts, targets, session, diagnostics, scheduler=None, observability=None
+        self,
+        settings,
+        contracts,
+        targets,
+        session,
+        diagnostics,
+        scheduler=None,
+        observability=None,
+        *,
+        platform_session=None,
+        environ=None,
     ):
         self.settings, self.contracts, self.targets = settings, contracts, targets
         self.session, self.diagnostics = session, diagnostics
+        self.platform_session = session if platform_session is None else platform_session
         self.scheduler = scheduler
         # The observation adapter is assembled by the entry point and may be absent: without it
         # this class emits no runtime event at all, which is exactly the pre-TS-103 behaviour.
@@ -346,22 +360,23 @@ class Gateway:
         # The ledger reports its own fixed persistence failures here, so the adapter never has
         # to read a row, a statement or an exception to observe one.
         self.diagnostics.observe(self.receipt_failure)
-        self.secrets = EnvSecrets(settings.secret_references)
+        self.secrets = EnvSecrets(settings.secret_references, environ=environ)
         self.origin_renewal = (
             OriginRenewal(
-                session,
+                self.platform_session,
                 targets,
                 self.secrets,
                 settings.platform_base_url,
                 settings.platform_credential_ref,
                 settings.platform_origin_env,
+                environ=environ,
             )
             if settings.platform_origin_renewal
             else None
         )
         self.cache = ConfigCache(
             HttpConfigSource(
-                session,
+                self.platform_session,
                 contracts,
                 targets,
                 self.secrets,
@@ -371,6 +386,7 @@ class Gateway:
                 # A verified snapshot is a real success of the platform dependency, so the
                 # readiness window is refreshed here and never on a cache hit.
                 on_success=self.note_platform,
+                environ=environ,
             ),
             contracts,
             targets,
@@ -383,13 +399,14 @@ class Gateway:
         if settings.native_enabled:
             self.native_cache = NativeConfigCache(
                 NativeConfigSource(
-                    session,
+                    self.platform_session,
                     contracts,
                     targets,
                     self.secrets,
                     settings.platform_base_url,
                     settings.platform_credential_ref,
                     settings.platform_origin_env,
+                    environ=environ,
                 ),
                 contracts,
                 targets,
@@ -409,7 +426,10 @@ class Gateway:
         )
         self.dynamic_source = (
             ProviderRuntimeSource(
-                session, settings.platform_base_url, self.secrets, settings.platform_credential_ref
+                self.platform_session,
+                settings.platform_base_url,
+                self.secrets,
+                settings.platform_credential_ref,
             )
             if settings.provider_self_service
             else None
@@ -1881,8 +1901,22 @@ def closed_probe(status, checks):
     )
 
 
-def create_app(settings, observability=None):
-    settings.validate()
+@asynccontextmanager
+async def _platform_channel(internal_clients, network_session):
+    """Only the registered Platform port is local; providers retain their network pool."""
+    if internal_clients is None:
+        yield network_session
+    else:
+        async with internal_clients.session_factory("platform")(
+            trust_env=False, auto_decompress=False
+        ) as session:
+            yield session
+
+
+def create_app(
+    settings, observability=None, *, internal_clients=None, environ=None, storage_options=None
+):
+    settings.validate(environ=environ)
     contract = None
     if settings.diagnostics_contract_directory is not None:
         # Read-only load with manifest hash verification: a package that disagrees with its own
@@ -1909,7 +1943,11 @@ def create_app(settings, observability=None):
     async def resources(app):
         diagnostics = Diagnostics(
             settings.diagnostics_path,
-            StorageOptions.from_settings({"storage_backends": settings.storage_backends}),
+            storage_options
+            if storage_options is not None
+            else StorageOptions.from_settings(
+                {"storage_backends": settings.storage_backends}, environ=environ
+            ),
         )
         try:
             for version in settings.revoked_versions:
@@ -1932,14 +1970,25 @@ def create_app(settings, observability=None):
             # queued by the scheduler itself instead of blocking inside the connector.
             pool = max(settings.max_concurrent, settings.policy.max_in_flight)
             connector = aiohttp.TCPConnector(resolver=targets, limit=pool + 1, ttl_dns_cache=0)
-            async with aiohttp.ClientSession(
-                connector=connector,
-                trust_env=False,
-                auto_decompress=False,
-                cookie_jar=aiohttp.DummyCookieJar(),
-            ) as session:
+            async with (
+                aiohttp.ClientSession(
+                    connector=connector,
+                    trust_env=False,
+                    auto_decompress=False,
+                    cookie_jar=aiohttp.DummyCookieJar(),
+                ) as session,
+                _platform_channel(internal_clients, session) as platform_session,
+            ):
                 gateway = Gateway(
-                    settings, contracts, targets, session, diagnostics, scheduler, observability
+                    settings,
+                    contracts,
+                    targets,
+                    session,
+                    diagnostics,
+                    scheduler,
+                    observability,
+                    platform_session=platform_session,
+                    environ=environ,
                 )
                 gateway.contract_verified = contract is not None
                 app[GATEWAY] = gateway

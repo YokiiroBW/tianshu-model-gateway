@@ -114,10 +114,12 @@ class Observability:
         instance_id=None,
         stderr=None,
         clock=time.monotonic,
+        environ=None,
     ):
         self.settings = settings
         self.contract = contract
         self.clock = clock
+        self.environ = os.environ if environ is None else environ
         self.log = sink.RuntimeLog(
             settings.log_directory,
             instance_id=instance_id,
@@ -197,7 +199,7 @@ class Observability:
 
     def probe_token(self):
         """The readiness credential, read at probe time so a rotation needs no restart."""
-        return os.environ.get(self.settings.probe_token_env, "")
+        return self.environ.get(self.settings.probe_token_env, "")
 
     @property
     def readiness(self):

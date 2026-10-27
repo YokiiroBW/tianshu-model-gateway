@@ -18,7 +18,7 @@ async def configuration(gateway, payload):
     token = gateway.secrets.resolve(gateway.settings.platform_credential_ref)
     try:
         async with asyncio.timeout(5):
-            async with gateway.session.post(
+            async with gateway.platform_session.post(
                 gateway.settings.platform_base_url + PATH,
                 json=payload,
                 headers={"Authorization": "Bearer " + token, "Accept-Encoding": "identity"},

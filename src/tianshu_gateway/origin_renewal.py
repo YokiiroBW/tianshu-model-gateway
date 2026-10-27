@@ -56,12 +56,23 @@ def validate_settings(enabled, base_url):
 
 
 class OriginRenewal:
-    def __init__(self, session, targets, secrets, base_url, credential_ref, origin_env):
+    def __init__(
+        self,
+        session,
+        targets,
+        secrets,
+        base_url,
+        credential_ref,
+        origin_env,
+        *,
+        environ=None,
+    ):
         validate_settings(True, base_url)
         targets.check(base_url)
         self.session, self.secrets = session, secrets
         self.base_url, self.credential_ref, self.origin_env = base_url, credential_ref, origin_env
-        self.ref = os.environ.get(origin_env, "")
+        self.environ = os.environ if environ is None else environ
+        self.ref = self.environ.get(origin_env, "")
         if REF.fullmatch(self.ref) is None:
             raise Rejected("dependency_unavailable", 503)
         self.expires_at = None
@@ -80,7 +91,7 @@ class OriginRenewal:
         if self.closed:
             raise Rejected("dependency_unavailable", 503)
         # Environment is bootstrap input, never a live channel for silently replacing authority.
-        if os.environ.get(self.origin_env, "") != self.ref:
+        if self.environ.get(self.origin_env, "") != self.ref:
             self.deny()
         if self.expires_at is not None and (
             time.time() >= self.expires_at or time.monotonic() >= self.deadline
