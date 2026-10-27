@@ -4,6 +4,8 @@ import asyncio
 import copy
 import tempfile
 import unittest
+import ssl
+from dataclasses import replace
 from pathlib import Path
 
 import aiohttp
@@ -119,6 +121,36 @@ class InternalGatewayTests(unittest.IsolatedAsyncioTestCase):
             "X-Tianshu-Config-Version": "7",
             "X-Tianshu-Workload": "companion.text",
         }
+
+    async def test_owned_network_trust_reaches_real_https_provider(self):
+        from observability_fixtures import start_tls
+
+        upstream = web.Application()
+        upstream.router.add_post("/v1/chat/completions", self.services.upstream)
+        tls_directory = Path(self.temp.name) / "network-tls"
+        runner, url = await start_tls(upstream, tls_directory)
+        self.addAsyncCleanup(runner.cleanup)
+        self.services.configure(url)
+        trust = ssl.create_default_context(cafile=tls_directory / "server.crt")
+        settings = replace(
+            self.settings,
+            diagnostics_path=str(Path(self.temp.name) / "https-provider.sqlite"),
+            targets=[registration(self.platform_url), registration(url + "/v1")],
+        )
+        app = create_app(
+            settings, internal_clients=self.exchange, environ=dict(SECRETS), network_ssl=trust
+        )
+        runner, gateway = await start_http(app)
+        self.addAsyncCleanup(runner.cleanup)
+        async with aiohttp.ClientSession() as client:
+            async with client.post(
+                gateway + "/v1/chat/completions",
+                json=DOCUMENTS["native_request"],
+                headers=self.headers("owned-ca-request"),
+            ) as response:
+                self.assertEqual(response.status, 200, await response.text())
+                self.assertEqual(await response.json(), self.services.response)
+        self.assertEqual(len(self.services.calls), 1)
 
     async def test_local_config_and_gateway_keep_external_provider_and_receipt(self):
         async with self.client.post(

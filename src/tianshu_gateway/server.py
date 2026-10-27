@@ -1914,7 +1914,13 @@ async def _platform_channel(internal_clients, network_session):
 
 
 def create_app(
-    settings, observability=None, *, internal_clients=None, environ=None, storage_options=None
+    settings,
+    observability=None,
+    *,
+    internal_clients=None,
+    environ=None,
+    storage_options=None,
+    network_ssl=None,
 ):
     settings.validate(environ=environ)
     contract = None
@@ -1969,7 +1975,12 @@ def create_app(
             # call. Kept at the same size as the admission limit so a full pool is refused or
             # queued by the scheduler itself instead of blocking inside the connector.
             pool = max(settings.max_concurrent, settings.policy.max_in_flight)
-            connector = aiohttp.TCPConnector(resolver=targets, limit=pool + 1, ttl_dns_cache=0)
+            connector = aiohttp.TCPConnector(
+                resolver=targets,
+                limit=pool + 1,
+                ttl_dns_cache=0,
+                **({"ssl": network_ssl} if network_ssl is not None else {}),
+            )
             async with (
                 aiohttp.ClientSession(
                     connector=connector,
