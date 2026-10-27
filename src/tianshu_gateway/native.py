@@ -5,7 +5,6 @@ its own wire names. Nothing here reads or inherits the Chat ``config_version`` c
 identity is only ever taken from the deployment registration that authenticated the call.
 """
 
-import asyncio
 import copy
 import os
 import time
@@ -14,7 +13,7 @@ from dataclasses import dataclass
 
 import aiohttp
 
-from .config import SourceUnavailable, read_limited, timestamp, utcnow
+from .config import SourceUnavailable, VersionLocks, read_limited, timestamp, utcnow
 from .contracts import (
     NATIVE_CONTRACT,
     NATIVE_PROTOCOL,
@@ -315,7 +314,7 @@ class NativeConfigCache:
         )
         self.refresh_seconds, self.max_entries = refresh_seconds, max_entries
         self.entries = {}
-        self.lock = asyncio.Lock()
+        self.loads = VersionLocks()
 
     def revoke(self, grant, version):
         identity = grant.identity()
@@ -328,7 +327,7 @@ class NativeConfigCache:
 
     async def get(self, grant, requested):
         identity = grant.identity()
-        async with self.lock:
+        async with self.loads.acquire((identity, requested)):
             if requested is not None:
                 # A revoked native version is refused without consulting the platform again.
                 self.reject_revoked(identity, requested)

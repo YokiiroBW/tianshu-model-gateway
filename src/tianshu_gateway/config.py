@@ -8,6 +8,7 @@ import os
 import socket
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -314,6 +315,34 @@ async def read_limited(content, limit):
     return bytes(result)
 
 
+class VersionLocks:
+    """Serialize a cache key's loads without parking unrelated configurations.
+
+    Cache instances belong to one event loop. References include queued waiters,
+    so cancellation cannot remove a lock another load is still using. Idle keys
+    are discarded instead of accumulating one lock per historical version.
+    """
+
+    def __init__(self):
+        self._entries = {}
+
+    @asynccontextmanager
+    async def acquire(self, key):
+        lock, users = self._entries.get(key, (None, 0))
+        if lock is None:
+            lock = asyncio.Lock()
+        self._entries[key] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            _, users = self._entries[key]
+            if users == 1:
+                del self._entries[key]
+            else:
+                self._entries[key] = (lock, users - 1)
+
+
 class ConfigCache:
     def __init__(self, source, contracts, targets, diagnostics, refresh_seconds=30, max_entries=32):
         self.source, self.contracts, self.targets, self.diagnostics = (
@@ -324,14 +353,14 @@ class ConfigCache:
         )
         self.refresh_seconds, self.max_entries = refresh_seconds, max_entries
         self.entries = {}
-        self.lock = asyncio.Lock()
+        self.loads = VersionLocks()
 
     def revoke(self, version):
         self.diagnostics.revoke(version)
         self.entries.pop(version, None)
 
     async def get(self, version):
-        async with self.lock:
+        async with self.loads.acquire(version):
             if self.diagnostics.is_revoked(version):
                 raise Rejected("forbidden", 403)
             cached = self.entries.get(version)
