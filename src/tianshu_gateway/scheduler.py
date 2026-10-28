@@ -64,6 +64,20 @@ def _ignore(fact):
     return None
 
 
+async def _complete_cleanup(operation):
+    """Finish the ledger move even if the disappearing caller is cancelled again."""
+    task = asyncio.create_task(operation)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 # The two deployment classes of this slice. They are local runtime policy, not part of any
 # published contract, and no protocol field, model name or header maps onto them.
 INTERACTIVE = "interactive"
@@ -343,6 +357,7 @@ class BoundedAdmissionScheduler:
         is never taken from the client, so the provider limit this request waits for can never
         be retargeted while it waits.
         """
+        waiter = None
         try:
             waiter = await self._enroll(
                 service, workload_class, declared_workload, key, provider_id
@@ -356,17 +371,30 @@ class BoundedAdmissionScheduler:
                 # have waited.
                 self._form(service, waiter.key, workload_class, QUEUED, None, True)
             return await self._wait(waiter, timeout_ms)
+        except asyncio.CancelledError:
+            # Enrollment, pumping and recording a queued fact can all wait on
+            # the ledger lock before _wait gets ownership of cancellation.
+            if waiter is not None:
+                await _complete_cleanup(self._discard(waiter, CANCELLED))
+            raise
         finally:
             self.flush()
 
     async def release(self, waiter):
         """Free everything this waiter holds; the adapter guards against a second call."""
         try:
-            async with self.lock:
-                if self._release_locked(waiter):
-                    self._advance_locked()
+            try:
+                await self._release(waiter)
+            except asyncio.CancelledError:
+                await _complete_cleanup(self._release(waiter))
+                raise
         finally:
             self.flush()
+
+    async def _release(self, waiter):
+        async with self.lock:
+            if self._release_locked(waiter):
+                self._advance_locked()
 
     def flush(self):
         """Emit formed facts outside the lock; a failing sink only degrades.

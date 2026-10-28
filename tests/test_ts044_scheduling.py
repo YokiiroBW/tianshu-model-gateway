@@ -49,6 +49,7 @@ from tianshu_gateway.scheduler import (
     BoundedAdmissionScheduler,
     DuplicateRequest,
     QueueFull,
+    bind,
 )
 from tianshu_gateway.server import GATEWAY, Settings, create_app, load_settings
 
@@ -470,6 +471,57 @@ class SchedulerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.scheduler.inflight, 0)
         self.assertEqual(self.scheduler.provider_active, {})
         self.assertEqual(self.scheduler.interactive_claimed, 0)
+
+    async def test_cancel_between_enrollment_and_admission_removes_waiter(self):
+        self.build(max_in_flight=1, max_provider_in_flight=1, interactive_reserve=0)
+        await self.scheduler.lock.acquire()
+        pending = self.acquiring("companion", INTERACTIVE, "cancel-before-pump")
+        await asyncio.sleep(0)
+        holding, release = asyncio.Event(), asyncio.Event()
+
+        async def contend():
+            async with self.scheduler.lock:
+                holding.set()
+                await release.wait()
+
+        contender = asyncio.create_task(contend())
+        await asyncio.sleep(0)
+        self.scheduler.lock.release()
+        await asyncio.wait_for(holding.wait(), 1)
+        self.assertEqual(self.scheduler.waiting_keys(), {"cancel-before-pump"})
+        pending.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        await contender
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertEqual(self.scheduler.waiting, 0)
+        self.assertEqual(self.scheduler.inflight, 0)
+        successor = await self.permit("companion", INTERACTIVE, "successor")
+        await self.scheduler.release(successor)
+        await self.wait_idle()
+
+    async def test_repeated_cancel_during_permit_release_returns_capacity(self):
+        self.build(max_in_flight=1, max_provider_in_flight=1, interactive_reserve=0)
+        permit = bind(self.scheduler, "companion", INTERACTIVE, None, "provider-a", "held")
+        await permit.__aenter__()
+        await self.scheduler.lock.acquire()
+        releasing = asyncio.create_task(permit.release())
+        await asyncio.sleep(0)
+        releasing.cancel()
+        await asyncio.sleep(0)
+        releasing.cancel()
+        await asyncio.sleep(0)
+        self.scheduler.lock.release()
+        with self.assertRaises(asyncio.CancelledError):
+            await releasing
+        await permit.release()
+        self.assertEqual(self.scheduler.inflight, 0)
+        self.assertEqual(self.scheduler.provider_active, {})
+        self.assertEqual(self.scheduler.interactive_claimed, 0)
+        successor = await self.permit("companion", INTERACTIVE, "successor")
+        await self.scheduler.release(successor)
+        await self.wait_idle()
 
     async def test_observation_failure_never_changes_admission(self):
         self.build()
